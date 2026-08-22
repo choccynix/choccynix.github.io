@@ -1,5 +1,0 @@
-x11-base/xlibre-server          use:-elogind
-x11-base/xlibre-drivers
-x11-wm/dwm
-x11-terms/st
-x11-misc/dmenu

@@ -1,3 +1,0 @@
-FEATURES="${FEATURES} getbinpkg"
-PORTAGE_BINHOST="https://choccynix.github.io/"
-EMERGE_DEFAULT_OPTS="${EMERGE_DEFAULT_OPTS} --getbinpkg=y --binpkg-respect-use=y"

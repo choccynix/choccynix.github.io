@@ -1,6 +1,0 @@
-x11-base/xorg-server
-x11-apps/xinit
-x11-drivers/xf86-input-libinput
-x11-wm/dwm
-x11-terms/st
-x11-misc/dmenu

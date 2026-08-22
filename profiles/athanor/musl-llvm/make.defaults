@@ -1,2 +1,0 @@
-# Global defaults for AthanorOS targets
-USE="-systemd elogind pipewire wayland vulkan"
