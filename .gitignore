@@ -1,0 +1,4 @@
+*.gpkg.tar
+*.tbz2
+*.xpak
+temp_*
