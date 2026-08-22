@@ -5,6 +5,7 @@ import subprocess
 import shutil
 import gzip
 import tempfile
+import re
 from concurrent.futures import ThreadPoolExecutor
 
 # --- Configuration ---
@@ -45,9 +46,10 @@ def setup_directories():
 
 def get_pkg_metadata(filepath):
     """
-    Extract CATEGORY and PN from modern Gentoo GPKG packages using secure Temp directories.
+    Extract CATEGORY and PN from modern Gentoo GPKG packages.
+    If PN is missing, calculates it dynamically from PF using Portage.
     """
-    category, pn = None, None
+    category, pn, pf = None, None, None
     filename = os.path.basename(filepath)
 
     if filepath.endswith('.gpkg.tar'):
@@ -78,7 +80,7 @@ def get_pkg_metadata(filepath):
                         print(f"Inner tar extraction failed for {filename}: {res2.stderr.strip()}")
                         return None, None
 
-                    # 4. Recursively find CATEGORY and PN
+                    # 4. Find CATEGORY, PN, and PF
                     for root, dirs, files in os.walk(meta_dir):
                         if "CATEGORY" in files and not category:
                             with open(os.path.join(root, "CATEGORY"), "r", encoding="utf-8", errors="ignore") as f:
@@ -86,13 +88,9 @@ def get_pkg_metadata(filepath):
                         if "PN" in files and not pn:
                             with open(os.path.join(root, "PN"), "r", encoding="utf-8", errors="ignore") as f:
                                 pn = f.read().strip()
-
-                    if not category or not pn:
-                        # Log if we successfully opened it but couldn't find the text files
-                        all_files = []
-                        for r, d, f in os.walk(meta_dir):
-                            all_files.extend(f)
-                        print(f"Missing CATEGORY/PN in {filename}. Extracted these files instead: {all_files}")
+                        if "PF" in files and not pf:
+                            with open(os.path.join(root, "PF"), "r", encoding="utf-8", errors="ignore") as f:
+                                pf = f.read().strip()
 
             except Exception as e:
                 print(f"Exception extracting {filename}: {e}")
@@ -103,12 +101,35 @@ def get_pkg_metadata(filepath):
             xpak = portage.xpak.tbz2(filepath)
             cat_data = xpak.get_data(b"CATEGORY")
             pn_data = xpak.get_data(b"PN")
+            pf_data = xpak.get_data(b"PF")
             if cat_data:
                 category = cat_data.decode('utf-8', errors='ignore').strip()
             if pn_data:
                 pn = pn_data.decode('utf-8', errors='ignore').strip()
+            if pf_data:
+                pf = pf_data.decode('utf-8', errors='ignore').strip()
         except Exception:
             pass
+
+    # 5. Calculate PN from PF if PN was not saved by Portage
+    if category and not pn and pf:
+        try:
+            # Use Gentoo's native package splitter to separate name from version
+            import portage.versions
+            splitted = portage.versions.pkgsplit(pf)
+            if splitted:
+                pn = splitted[0]
+        except Exception:
+            pass
+            
+        # Fallback regex just in case portage module fails
+        if not pn:
+            match = re.match(r'^(.+?)-(\d+.*)$', pf)
+            if match:
+                pn = match.group(1)
+
+    if not category or not pn:
+        print(f"Missing crucial metadata in {filename} (Category: {category}, PN: {pn}, PF: {pf})")
 
     return category, pn
 
@@ -140,7 +161,6 @@ def fetch_and_organize_binpkgs():
             name = asset['name']
             url = asset['browser_download_url']
             
-            # Skip invalid filenames
             if name.endswith(('.gpkg.tar', '.tbz2', '.xpak')) and ".-" not in name:
                 asset_url_map[name] = url
                 to_download.append((name, url))
@@ -168,7 +188,6 @@ def fetch_and_organize_binpkgs():
             all_pkgs.append((cat, pn, name, download_url))
             print(f"Sorted: {cat}/{pn}/{name}")
         else:
-            # Drop invalid or corrupted files completely
             print(f"Could not identify metadata for {name}, skipping.")
 
     shutil.rmtree(TEMP_DIR, ignore_errors=True)
@@ -186,7 +205,6 @@ def generate_packages_index(asset_url_map):
             with open(packages_src, "r", encoding="utf-8") as f:
                 content = f.read()
 
-            # Inject the remote URI into each package entry
             entries = content.split("\n\n")
             new_entries = []
             for entry in entries:
@@ -214,7 +232,6 @@ def generate_packages_index(asset_url_map):
     except Exception as e:
         print(f"emaint binhost generation error: {e}")
     finally:
-        # Delete temporary packages so git stays lightweight
         shutil.rmtree(TEMP_BINHOST, ignore_errors=True)
 
 def generate_website(pkgs):
