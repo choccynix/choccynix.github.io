@@ -4,8 +4,8 @@ import tarfile
 import urllib.request
 import subprocess
 import shutil
-import io
 import gzip
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 # --- Configuration ---
@@ -20,24 +20,21 @@ TEMP_DIR = "temp_downloads"
 TEMP_BINHOST = "temp_binhost"
 
 def setup_directories():
-    """Create basic Gentoo repository structure and cleanup old binary files."""
+    """Create repository structure and clean up previous artifacts."""
     os.makedirs(BINHOST_DIR, exist_ok=True)
     os.makedirs(PROFILES_DIR, exist_ok=True)
     os.makedirs(METADATA_DIR, exist_ok=True)
 
-    if not os.path.exists(os.path.join(PROFILES_DIR, "repo_name")):
-        with open(os.path.join(PROFILES_DIR, "repo_name"), "w") as f:
-            f.write(f"{REPO_OWNER}\n")
+    with open(os.path.join(PROFILES_DIR, "repo_name"), "w") as f:
+        f.write(f"{REPO_OWNER}\n")
     
-    if not os.path.exists(os.path.join(METADATA_DIR, "layout.conf")):
-        with open(os.path.join(METADATA_DIR, "layout.conf"), "w") as f:
-            f.write("masters = gentoo\nauto-sync = false\n")
+    with open(os.path.join(METADATA_DIR, "layout.conf"), "w") as f:
+        f.write("masters = gentoo\nauto-sync = false\n")
 
-    # Write a .gitignore to make sure no binary packages are ever tracked in git
     with open(".gitignore", "w") as f:
         f.write("*.gpkg.tar\n*.tbz2\n*.xpak\ntemp_*\n")
 
-    # Clean up any raw packages left over in binhost from previous runs
+    # Remove loose package files from previous runs
     for root, dirs, files in os.walk(BINHOST_DIR):
         for f in files:
             if f.endswith(('.gpkg.tar', '.tbz2', '.xpak')):
@@ -47,46 +44,63 @@ def setup_directories():
                     pass
 
 def get_pkg_metadata(filepath):
-    """Extract CATEGORY and PN from a modern Gentoo GPKG or legacy TBZ2 package."""
+    """
+    Extract CATEGORY and PN from modern Gentoo GPKG or legacy TBZ2 packages
+    by extracting metadata to a temporary sandbox directory.
+    """
     category, pn = None, None
+    filename = os.path.basename(filepath)
 
+    # 1. Handle modern GPKG archives (.gpkg.tar)
     if filepath.endswith('.gpkg.tar'):
-        # 1. Inspect outer tar headers (category is in the internal path: category/PF/metadata.tar.zst)
-        try:
-            with tarfile.open(filepath, "r") as tar:
-                for name in tar.getnames():
-                    if "metadata.tar" in name:
-                        parts = name.strip("./").split("/")
-                        if len(parts) >= 3:
-                            category = parts[0]
+        with tempfile.TemporaryDirectory() as extract_dir:
+            try:
+                # Extract the outer archive
+                subprocess.run(
+                    ["tar", "-xf", filepath, "-C", extract_dir],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=True
+                )
+                
+                # Locate metadata.tar.* inside the extracted tree
+                meta_archive = None
+                for root, dirs, files in os.walk(extract_dir):
+                    for f in files:
+                        if "metadata.tar" in f:
+                            meta_archive = os.path.join(root, f)
+                            break
+                    if meta_archive:
                         break
-        except Exception:
-            pass
 
-        # 2. Decompress nested metadata.tar.zst directly using zstd -dc
-        try:
-            with tarfile.open(filepath, "r") as outer_tar:
-                for member in outer_tar.getmembers():
-                    if "metadata.tar" in member.name:
-                        f = outer_tar.extractfile(member)
-                        if f:
-                            meta_bytes = f.read()
-                            if member.name.endswith(".zst"):
-                                proc = subprocess.Popen(["zstd", "-dc"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                                meta_bytes, _ = proc.communicate(input=meta_bytes)
-                            
-                            with tarfile.open(fileobj=io.BytesIO(meta_bytes), mode="r:*") as inner_tar:
-                                for inner_member in inner_tar.getmembers():
-                                    base_name = os.path.basename(inner_member.name)
-                                    if base_name == "CATEGORY":
-                                        category = inner_tar.extractfile(inner_member).read().decode('utf-8', errors='ignore').strip()
-                                    elif base_name == "PN":
-                                        pn = inner_tar.extractfile(inner_member).read().decode('utf-8', errors='ignore').strip()
-                                if category and pn:
-                                    return category, pn
-        except Exception:
-            pass
+                if meta_archive:
+                    meta_extract_dir = os.path.join(extract_dir, "meta_extracted")
+                    os.makedirs(meta_extract_dir, exist_ok=True)
+                    
+                    # Unpack metadata.tar.* (supports .zst, .gz, .xz, etc.)
+                    subprocess.run(
+                        ["tar", "-xf", meta_archive, "-C", meta_extract_dir],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=True
+                    )
 
+                    # Read CATEGORY and PN
+                    cat_file = os.path.join(meta_extract_dir, "CATEGORY")
+                    pn_file = os.path.join(meta_extract_dir, "PN")
+
+                    if os.path.exists(cat_file):
+                        with open(cat_file, "r", encoding="utf-8", errors="ignore") as f:
+                            category = f.read().strip()
+
+                    if os.path.exists(pn_file):
+                        with open(pn_file, "r", encoding="utf-8", errors="ignore") as f:
+                            pn = f.read().strip()
+
+            except Exception as e:
+                print(f"Error parsing GPKG {filename}: {e}")
+
+    # 2. Handle legacy TBZ2 / XPAK packages
     elif filepath.endswith(('.tbz2', '.xpak')):
         try:
             import portage.xpak
@@ -97,8 +111,6 @@ def get_pkg_metadata(filepath):
                 category = cat_data.decode('utf-8', errors='ignore').strip()
             if pn_data:
                 pn = pn_data.decode('utf-8', errors='ignore').strip()
-            if category and pn:
-                return category, pn
         except Exception:
             pass
 
@@ -132,14 +144,15 @@ def fetch_and_organize_binpkgs():
             name = asset['name']
             url = asset['browser_download_url']
             
-            if name.endswith(('.gpkg.tar', '.tbz2', '.xpak')):
+            # Skip invalid filenames (e.g. gtk.-3...)
+            if name.endswith(('.gpkg.tar', '.tbz2', '.xpak')) and ".-" not in name:
                 asset_url_map[name] = url
                 to_download.append((name, url))
 
     os.makedirs(TEMP_DIR, exist_ok=True)
     os.makedirs(TEMP_BINHOST, exist_ok=True)
 
-    print(f"Processing {len(to_download)} packages in parallel...")
+    print(f"Downloading and extracting metadata for {len(to_download)} packages (8 threads)...")
     with ThreadPoolExecutor(max_workers=8) as executor:
         downloaded = list(executor.map(download_asset, to_download))
 
@@ -157,30 +170,26 @@ def fetch_and_organize_binpkgs():
             target_path = os.path.join(target_dir, name)
             shutil.move(temp_path, target_path)
             all_pkgs.append((cat, pn, name, download_url))
+            print(f"Successfully sorted: {cat}/{pn}/{name}")
         else:
-            # Fallback if category extraction failed
-            target_dir = os.path.join(TEMP_BINHOST, "unknown", "unknown")
-            os.makedirs(target_dir, exist_ok=True)
-            shutil.move(temp_path, os.path.join(target_dir, name))
-            all_pkgs.append(("unknown", "unknown", name, download_url))
+            print(f"Warning: Could not identify metadata for {name}")
 
     shutil.rmtree(TEMP_DIR, ignore_errors=True)
     return all_pkgs, asset_url_map
 
 def generate_packages_index(asset_url_map):
-    print("Generating Portage 'Packages' index using emaint...")
+    print("Generating Portage 'Packages' index via emaint...")
     try:
         env = os.environ.copy()
         env['PKGDIR'] = os.path.abspath(TEMP_BINHOST)
         subprocess.run(["emaint", "binhost", "--fix"], env=env, check=True)
 
-        # Read generated Packages file
         packages_src = os.path.join(TEMP_BINHOST, "Packages")
         if os.path.exists(packages_src):
             with open(packages_src, "r", encoding="utf-8") as f:
                 content = f.read()
 
-            # Inject the remote URI into each package entry
+            # Inject remote URL into each package header
             entries = content.split("\n\n")
             new_entries = []
             for entry in entries:
@@ -198,18 +207,17 @@ def generate_packages_index(asset_url_map):
 
             final_packages = "\n\n".join(new_entries) + "\n"
 
-            # Write clean Packages and Packages.gz to binhost/
             with open(os.path.join(BINHOST_DIR, "Packages"), "w", encoding="utf-8") as f:
                 f.write(final_packages)
 
             with gzip.open(os.path.join(BINHOST_DIR, "Packages.gz"), "wb") as f:
                 f.write(final_packages.encode('utf-8'))
 
-            print("Packages and Packages.gz index generated with remote URIs successfully.")
+            print("Packages and Packages.gz created successfully with proper categories!")
     except Exception as e:
-        print(f"emaint binhost generation failed: {e}")
+        print(f"emaint binhost generation error: {e}")
     finally:
-        # Clean up temporary downloaded binpkgs so they are NEVER committed to git
+        # Delete temporary binpkgs so git stays clean (< 2 MB)
         shutil.rmtree(TEMP_BINHOST, ignore_errors=True)
 
 def generate_website(pkgs):
@@ -221,12 +229,12 @@ def generate_website(pkgs):
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{REPO_OWNER} Gentoo Repository & Binhost</title>
     <style>
-        body {{ font-family: system-ui, -apple-system, sans-serif; margin: 2rem auto; max-width: 800px; background: #1e1e1e; color: #e0e0e0; }}
+        body {{ font-family: system-ui, -apple-system, sans-serif; margin: 2rem auto; max-width: 850px; background: #1e1e1e; color: #e0e0e0; padding: 0 1rem; }}
         a {{ color: #66b3ff; text-decoration: none; }}
         a:hover {{ text-decoration: underline; }}
         h1, h2 {{ border-bottom: 1px solid #444; padding-bottom: 0.5rem; }}
         ul {{ list-style: none; padding: 0; }}
-        li {{ margin: 0.5rem 0; background: #2a2a2a; padding: 1rem; border-radius: 6px; }}
+        li {{ margin: 0.5rem 0; background: #2a2a2a; padding: 0.8rem 1rem; border-radius: 6px; }}
         .package {{ display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }}
         .category {{ font-weight: bold; color: #a0c4ff; }}
         code {{ background: #000; padding: 0.2rem 0.4rem; border-radius: 4px; font-size: 0.9em; }}
