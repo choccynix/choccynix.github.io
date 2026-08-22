@@ -1,0 +1,104 @@
+name: Build Binpkgs and Deploy to Pages
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 4 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build-packages:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [core, desktop, graphics, browser, kde-qt, xorg, xlibre]
+    container:
+      image: gentoo/stage3:musl-llvm
+      options: --privileged
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+    steps:
+      - name: Fetch Repo
+        run: |
+          python3 -c "import os,urllib.request as u; t=os.environ['GITHUB_TOKEN']; r=os.environ['GITHUB_REPOSITORY']; s=os.environ['GITHUB_SHA']; req=u.Request('https://api.github.com/repos/%s/tarball/%s' % (r, s), headers={'Authorization':'Bearer '+t,'Accept':'application/vnd.github+json'}); open('/tmp/src.tar.gz','wb').write(u.urlopen(req).read())"
+          mkdir -p /var/db/repos/athanor
+          tar -xzf /tmp/src.tar.gz -C /var/db/repos/athanor --strip-components=1
+
+      - name: Sync Portage
+        run: emerge-webrsync
+
+      - name: Configure Overlay in Container
+        run: |
+          mkdir -p /etc/portage/repos.conf
+          cat <<EOF > /etc/portage/repos.conf/athanor.conf
+          [athanor]
+          location = /var/db/repos/athanor
+          masters = gentoo
+          auto-sync = no
+          EOF
+
+      - name: Build Binaries
+        run: |
+          mkdir -p /var/cache/binpkgs
+          python3 /var/db/repos/athanor/scripts/build-binpkg.py \
+            /var/db/repos/athanor/package-lists/packages.${{ matrix.group }}.list \
+            /var/cache/binpkgs
+
+      - name: Upload Blobs to Release
+        run: |
+          TAG="binpkgs-rolling"
+          python3 /var/db/repos/athanor/scripts/upload-release.py \
+            /var/cache/binpkgs "$TAG" /var/cache/binpkgs/upload-map.json
+          python3 /var/db/repos/athanor/scripts/generate-packages-index.py \
+            /var/cache/binpkgs/Packages /var/cache/binpkgs/upload-map.json \
+            /var/cache/binpkgs/Packages.fragment
+
+      - name: Upload Fragment Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fragment-${{ matrix.group }}
+          path: /var/cache/binpkgs/Packages.fragment
+
+  deploy-pages:
+    needs: build-packages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Index Fragments
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/fragments
+          pattern: fragment-*
+          merge-multiple: true
+
+      - name: Prepare Site Directory
+        run: |
+          mkdir -p _site
+          cp -r web/* _site/
+          python3 scripts/merge-packages-index.py _site/Packages /tmp/fragments/Packages.fragment*
+          touch _site/.nojekyll
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages Artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

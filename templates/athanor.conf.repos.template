@@ -1,0 +1,5 @@
+[athanor]
+location = /var/db/repos/athanor
+sync-type = git
+sync-uri = https://github.com/choccynix/choccynix.github.io.git
+auto-sync = yes

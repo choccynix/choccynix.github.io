@@ -1,0 +1,12 @@
+media-libs/mesa                   use:llvm,wayland,vulkan,-X
+x11-libs/libdrm
+x11-libs/pixman
+media-libs/libglvnd
+media-libs/vulkan-loader
+dev-libs/wayland
+dev-libs/wayland-protocols
+gui-libs/wlroots
+sys-auth/seatd
+media-libs/fontconfig
+media-libs/freetype
+media-fonts/noto
