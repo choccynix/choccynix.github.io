@@ -1,0 +1,58 @@
+# ◈ custom-package-workflow.yml.template
+#
+# Copy this into .github/workflows/ in a fork (or a downstream repo that
+# wants its own curated package set) and fill in the placeholders. It
+# mirrors build-packages.yml exactly but builds from a different list file
+# and publishes to a different release-tag prefix, so it can run
+# side-by-side with the upstream workflow without colliding.
+#
+# Placeholders to fill in:
+#   __PACKAGES_LIST__   e.g. "packages.desktop.list"
+#   __TAG_PREFIX__      e.g. "desktop-binpkgs"
+#   __GHPAGES_SUBDIR__  optional, if publishing multiple indexes from one
+#                       repo, e.g. "desktop/" (leave blank for repo root)
+
+name: Build __TAG_PREFIX__ packages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "__PACKAGES_LIST__"
+  workflow_dispatch: {}
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    container:
+      image: gentoo/stage3:musl-llvm
+      options: --privileged
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+    steps:
+      - name: Fetch repo tarball (git is not present in this container)
+        run: |
+          python3 -c "import os,urllib.request as u; t=os.environ['GITHUB_TOKEN']; r=os.environ['GITHUB_REPOSITORY']; s=os.environ['GITHUB_SHA']; req=u.Request('https://api.github.com/repos/%s/tarball/%s' % (r, s), headers={'Authorization':'Bearer '+t,'Accept':'application/vnd.github+json'}); open('/tmp/src.tar.gz','wb').write(u.urlopen(req).read())"
+          mkdir -p src
+          tar -xzf /tmp/src.tar.gz -C src --strip-components=1
+
+      - name: Sync portage tree
+        run: emerge-webrsync
+
+      - name: Build packages
+        working-directory: src
+        run: |
+          mkdir -p /var/cache/binpkgs
+          python3 scripts/build-binpkg.py __PACKAGES_LIST__ /var/cache/binpkgs
+
+      - name: Upload + publish
+        working-directory: src
+        run: |
+          TAG="__TAG_PREFIX__-$(date -u +%Y%m%d)"
+          python3 scripts/upload-release.py /var/cache/binpkgs "$TAG" /var/cache/binpkgs/upload-map.json
+          python3 scripts/generate-packages-index.py \
+            /var/cache/binpkgs/Packages /var/cache/binpkgs/upload-map.json \
+            /var/cache/binpkgs/Packages.final
+          # publish step: same gh-pages pattern as build-packages.yml,
+          # writing to __GHPAGES_SUBDIR__/Packages if set

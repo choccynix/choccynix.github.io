@@ -1,0 +1,11 @@
+# ◈ /etc/portage/package.use/athanor-binpkgs
+#
+# Prebuilt packages were built with a specific USE combination (see each
+# atom's optional use: annotation in packages.list upstream). If your local
+# USE flags don't match a package's build-time USE, Portage will refuse to
+# use the binary and fall back to source — which defeats the point.
+#
+# Mirror the upstream build flags here for anything you want as a binary.
+# Example, matching the sample packages.list entry for neovim:
+
+app-editors/neovim lua -python

@@ -1,0 +1,9 @@
+# ◈ /etc/portage/package.accept_keywords/athanor-binpkgs
+#
+# Only needed if a prebuilt package tracks ~arch (testing) rather than
+# stable. Add entries here matching whatever's actually in packages.list
+# upstream — check docs/binhost-setup.md for the current curated set before
+# assuming everything is stable-keyworded.
+#
+# Example:
+# app-editors/neovim ~amd64

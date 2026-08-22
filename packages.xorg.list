@@ -1,0 +1,28 @@
+# ◈ packages.xorg.list — mainline Xorg + suckless desktop
+#
+# Alternative to packages.xlibre.list (see that file for why they're
+# separate rather than combined — XLibre and Xorg cannot coexist on the
+# same installed system, so both are built and published, and the choice
+# of which to actually install is left to whoever's consuming the binhost).
+#
+# This is the safe, mainline option: x11-base/xorg-server lives in
+# Gentoo's main tree, unlike XLibre which needs a third-party overlay.
+#
+# media-libs/mesa is not listed explicitly here — it'll get pulled in
+# automatically with +X once xorg-server needs it, resolved via the same
+# --autounmask-write=y in build-binpkg.py already used elsewhere. This is
+# a different matrix job/container than packages.graphics.list (which
+# builds mesa with -X for the Wayland stack), so there's no conflict
+# between the two mesa builds — they simply never coexist in the same
+# container.
+#
+# xinit is included so X can actually be started (`startx`) rather than
+# just installed.
+
+x11-base/xorg-server
+x11-apps/xinit
+x11-drivers/xf86-input-libinput
+
+x11-wm/dwm
+x11-terms/st
+x11-misc/dmenu

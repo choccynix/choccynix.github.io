@@ -1,0 +1,38 @@
+name: ◈ Package request
+description: Ask for a package to be added to the AthanorOS binhost
+title: "[package] category/name"
+labels: ["package-request"]
+body:
+  - type: input
+    id: atom
+    attributes:
+      label: Package atom
+      description: "e.g. sys-apps/portage or app-editors/neovim-0.10.0"
+      placeholder: category/package[-version]
+    validations:
+      required: true
+
+  - type: input
+    id: use
+    attributes:
+      label: Desired USE flags (optional)
+      description: "Comma separated, matching packages.list syntax, e.g. lua,-python"
+      placeholder: flag1,-flag2
+
+  - type: textarea
+    id: why
+    attributes:
+      label: Why does this need a prebuilt binary?
+      description: Long compile time, hard-to-satisfy build deps under musl+llvm, common package others will need, etc.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I checked packages.list and this isn't already included
+          required: true
+        - label: I confirmed this package builds under musl+llvm (or I'm unsure and want CI to find out)
+          required: false

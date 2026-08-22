@@ -1,0 +1,50 @@
+# ◈ packages.xlibre.list — XLibre fork + suckless desktop
+#
+# Alternative to packages.xorg.list, not an addition to it. XLibre forked
+# from Xorg in 2025 after a dispute over code quality/maintenance of
+# recent Xorg contributions. Checked and confirmed (not assumed):
+#   - XLibre is NOT in Gentoo's main tree — requires the X11Libre/ports-gentoo
+#     overlay (or a fork of it), added by build-packages.yml only for this
+#     matrix group.
+#   - x11-base/xlibre-server file-collides with x11-base/xorg-server. The
+#     overlay's own docs require removing xorg-server/xorg-drivers before
+#     installing xlibre-server on a real system. This isn't a problem for
+#     CI (each matrix group builds in its own fresh, disposable container,
+#     so there's never a moment both are installed together) — it matters
+#     for whoever consumes this binhost: pick ONE of xorg-server or
+#     xlibre-server to actually install, not both.
+#   - x11-base/xlibre-drivers is the overlay's meta-package for the driver
+#     set, used here instead of xf86-input-libinput directly since XLibre's
+#     driver packaging doesn't necessarily mirror Xorg's 1:1.
+#   - Ebuilds in this overlay are commonly ~arch (testing) only, not
+#     stable-keyworded — build-packages.yml accepts ~amd64 for this group's
+#     atoms specifically, not system-wide (widened to the whole ::xlibre
+#     repo after a real run showed the driver meta-package pulls in
+#     transitive atoms beyond just the two top-level ones).
+#   - CONFIRMED via a real run: x11-base/xlibre-drivers' own dependency
+#     chain still pulled in mainline x11-base/xorg-server (the overlay's
+#     driver packaging isn't fully xlibre-aware yet), causing exactly the
+#     file collision described above. build-packages.yml now masks the
+#     ::gentoo copy specifically for this group to prevent that.
+#   - CONFIRMED via a real run (after the collision fix): sys-auth/elogind
+#     itself fails to compile (a genuine ninja/meson build failure). This
+#     is now the sole remaining blocker — everything else in this list
+#     resolved cleanly. XLibre's upstream project does support seatd as an
+#     alternative to elogind, but I couldn't confirm the exact Gentoo
+#     ebuild's USE flag name for it through available search results, and
+#     didn't want to hand over a guessed flag name. Instead, -elogind is
+#     now set explicitly below — Portage's own dependency solver will
+#     report what it actually wants instead on the next run, which is more
+#     reliable than guessing a flag name from outside the ebuild itself.
+#
+# Less proven than packages.xorg.list — a young fork, smaller community,
+# less mileage under musl specifically. Worth treating xorg-server as the
+# default and xlibre-server as the opt-in experiment until it's had more
+# real-world runtime.
+
+x11-base/xlibre-server          use:-elogind
+x11-base/xlibre-drivers
+
+x11-wm/dwm
+x11-terms/st
+x11-misc/dmenu
