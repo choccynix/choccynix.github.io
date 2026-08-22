@@ -27,7 +27,7 @@ name: Build binary packages
 
 on:
   push:
-    branches: [main]
+    branches: [gh-pages]
     paths:
       - "packages*.list"
       - "scripts/**"
@@ -38,7 +38,7 @@ on:
       - "scripts/**"
       - ".github/workflows/build-packages.yml"
   schedule:
-    - cron: "0 3 * * 0"  # Sunday 03:00 UTC, ahead of the ISO's midnight build
+    - cron: "0 3 * * *"  #Everyday at 3
   workflow_dispatch: {}
 
 permissions:
@@ -202,7 +202,7 @@ jobs:
 
   merge-and-publish:
     needs: build
-    if: github.event_name != 'pull_request'
+    if: always() && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
