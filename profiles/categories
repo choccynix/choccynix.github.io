@@ -1,8 +1,0 @@
-# ◈ profiles/categories
-#
-# Only needed for categories NOT already in the main Gentoo tree's own
-# profiles/categories (which this overlay inherits via masters=gentoo in
-# metadata/layout.conf). Standard categories like app-admin, sys-apps,
-# etc. don't need to be listed here — only add a line if you introduce a
-# genuinely new category (e.g. "athanor-misc") for something that doesn't
-# fit an existing one.

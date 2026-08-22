@@ -1,0 +1,51 @@
+name: Update Gentoo Binhost
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # Runs every day at midnight UTC
+  workflow_dispatch:    # Allows you to manually trigger it
+  push:
+    branches:
+      - gh-pages
+    paths:
+      - 'update_repo.py' # Run if you edit the python script
+      - '.github/workflows/**'
+
+permissions:
+  contents: write # Needed to allow the bot to commit and push
+
+jobs:
+  update-binhost:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+
+      - name: Update Repo and Generate Binhost
+        run: |
+          # Run the python script inside the official Gentoo container
+          # This gives us access to native 'emaint' and Portage python modules
+          docker run --rm -v ${{ github.workspace }}:/workspace gentoo/stage3 /bin/bash -c "
+            cd /workspace
+            python3 update_repo.py
+          "
+
+      - name: Commit and Push Changes
+        run: |
+          # The docker container runs as root, so we fix permissions for git
+          sudo chown -R $USER:$USER .
+          
+          # Setup git credentials for the GitHub Actions bot
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Add all new packages, folders, and index.html
+          git add .
+          
+          # Commit the changes (using [skip ci] so the push doesn't trigger another workflow run)
+          git commit -m "Auto-update Gentoo binhost [skip ci]" || echo "No new packages to add."
+          
+          # Push directly back to the gh-pages branch
+          git push origin gh-pages
