@@ -1,6 +1,5 @@
 import os
 import json
-import tarfile
 import urllib.request
 import subprocess
 import shutil
@@ -24,6 +23,7 @@ def setup_directories():
     os.makedirs(BINHOST_DIR, exist_ok=True)
     os.makedirs(PROFILES_DIR, exist_ok=True)
     os.makedirs(METADATA_DIR, exist_ok=True)
+    os.makedirs("/var/db/repos/gentoo", exist_ok=True)  # Silence Portage warning in stage3
 
     with open(os.path.join(PROFILES_DIR, "repo_name"), "w") as f:
         f.write(f"{REPO_OWNER}\n")
@@ -45,62 +45,58 @@ def setup_directories():
 
 def get_pkg_metadata(filepath):
     """
-    Extract CATEGORY and PN from modern Gentoo GPKG or legacy TBZ2 packages
-    by extracting metadata to a temporary sandbox directory.
+    Extract CATEGORY and PN from modern Gentoo GPKG packages using secure Temp directories.
     """
     category, pn = None, None
     filename = os.path.basename(filepath)
 
-    # 1. Handle modern GPKG archives (.gpkg.tar)
     if filepath.endswith('.gpkg.tar'):
-        with tempfile.TemporaryDirectory() as extract_dir:
+        with tempfile.TemporaryDirectory() as tmpdir:
             try:
-                # Extract the outer archive
-                subprocess.run(
-                    ["tar", "-xf", filepath, "-C", extract_dir],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=True
-                )
-                
-                # Locate metadata.tar.* inside the extracted tree
+                # 1. Unpack outer tar
+                res = subprocess.run(["tar", "-xf", filepath, "-C", tmpdir], capture_output=True, text=True)
+                if res.returncode != 0:
+                    print(f"Outer tar extraction failed for {filename}: {res.stderr.strip()}")
+                    return None, None
+
+                # 2. Locate metadata.tar*
                 meta_archive = None
-                for root, dirs, files in os.walk(extract_dir):
+                for root, dirs, files in os.walk(tmpdir):
                     for f in files:
                         if "metadata.tar" in f:
                             meta_archive = os.path.join(root, f)
                             break
-                    if meta_archive:
-                        break
+                    if meta_archive: break
 
                 if meta_archive:
-                    meta_extract_dir = os.path.join(extract_dir, "meta_extracted")
-                    os.makedirs(meta_extract_dir, exist_ok=True)
-                    
-                    # Unpack metadata.tar.* (supports .zst, .gz, .xz, etc.)
-                    subprocess.run(
-                        ["tar", "-xf", meta_archive, "-C", meta_extract_dir],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        check=True
-                    )
+                    meta_dir = os.path.join(tmpdir, "meta_extracted")
+                    os.makedirs(meta_dir, exist_ok=True)
 
-                    # Read CATEGORY and PN
-                    cat_file = os.path.join(meta_extract_dir, "CATEGORY")
-                    pn_file = os.path.join(meta_extract_dir, "PN")
+                    # 3. Unpack inner tar (GNU tar automatically handles .zst, .gz, .xz, etc.)
+                    res2 = subprocess.run(["tar", "-xf", meta_archive, "-C", meta_dir], capture_output=True, text=True)
+                    if res2.returncode != 0:
+                        print(f"Inner tar extraction failed for {filename}: {res2.stderr.strip()}")
+                        return None, None
 
-                    if os.path.exists(cat_file):
-                        with open(cat_file, "r", encoding="utf-8", errors="ignore") as f:
-                            category = f.read().strip()
+                    # 4. Recursively find CATEGORY and PN
+                    for root, dirs, files in os.walk(meta_dir):
+                        if "CATEGORY" in files and not category:
+                            with open(os.path.join(root, "CATEGORY"), "r", encoding="utf-8", errors="ignore") as f:
+                                category = f.read().strip()
+                        if "PN" in files and not pn:
+                            with open(os.path.join(root, "PN"), "r", encoding="utf-8", errors="ignore") as f:
+                                pn = f.read().strip()
 
-                    if os.path.exists(pn_file):
-                        with open(pn_file, "r", encoding="utf-8", errors="ignore") as f:
-                            pn = f.read().strip()
+                    if not category or not pn:
+                        # Log if we successfully opened it but couldn't find the text files
+                        all_files = []
+                        for r, d, f in os.walk(meta_dir):
+                            all_files.extend(f)
+                        print(f"Missing CATEGORY/PN in {filename}. Extracted these files instead: {all_files}")
 
             except Exception as e:
-                print(f"Error parsing GPKG {filename}: {e}")
+                print(f"Exception extracting {filename}: {e}")
 
-    # 2. Handle legacy TBZ2 / XPAK packages
     elif filepath.endswith(('.tbz2', '.xpak')):
         try:
             import portage.xpak
@@ -144,7 +140,7 @@ def fetch_and_organize_binpkgs():
             name = asset['name']
             url = asset['browser_download_url']
             
-            # Skip invalid filenames (e.g. gtk.-3...)
+            # Skip invalid filenames
             if name.endswith(('.gpkg.tar', '.tbz2', '.xpak')) and ".-" not in name:
                 asset_url_map[name] = url
                 to_download.append((name, url))
@@ -170,9 +166,10 @@ def fetch_and_organize_binpkgs():
             target_path = os.path.join(target_dir, name)
             shutil.move(temp_path, target_path)
             all_pkgs.append((cat, pn, name, download_url))
-            print(f"Successfully sorted: {cat}/{pn}/{name}")
+            print(f"Sorted: {cat}/{pn}/{name}")
         else:
-            print(f"Warning: Could not identify metadata for {name}")
+            # Drop invalid or corrupted files completely
+            print(f"Could not identify metadata for {name}, skipping.")
 
     shutil.rmtree(TEMP_DIR, ignore_errors=True)
     return all_pkgs, asset_url_map
@@ -189,7 +186,7 @@ def generate_packages_index(asset_url_map):
             with open(packages_src, "r", encoding="utf-8") as f:
                 content = f.read()
 
-            # Inject remote URL into each package header
+            # Inject the remote URI into each package entry
             entries = content.split("\n\n")
             new_entries = []
             for entry in entries:
@@ -213,11 +210,11 @@ def generate_packages_index(asset_url_map):
             with gzip.open(os.path.join(BINHOST_DIR, "Packages.gz"), "wb") as f:
                 f.write(final_packages.encode('utf-8'))
 
-            print("Packages and Packages.gz created successfully with proper categories!")
+            print("Packages index generated successfully.")
     except Exception as e:
         print(f"emaint binhost generation error: {e}")
     finally:
-        # Delete temporary binpkgs so git stays clean (< 2 MB)
+        # Delete temporary packages so git stays lightweight
         shutil.rmtree(TEMP_BINHOST, ignore_errors=True)
 
 def generate_website(pkgs):
