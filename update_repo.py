@@ -5,6 +5,7 @@ import urllib.request
 import subprocess
 import shutil
 import io
+import gzip
 from concurrent.futures import ThreadPoolExecutor
 
 # --- Configuration ---
@@ -16,9 +17,10 @@ BINHOST_DIR = "binhost"
 PROFILES_DIR = "profiles"
 METADATA_DIR = "metadata"
 TEMP_DIR = "temp_downloads"
+TEMP_BINHOST = "temp_binhost"
 
 def setup_directories():
-    """Create basic Gentoo repository structure."""
+    """Create basic Gentoo repository structure and cleanup old binary files."""
     os.makedirs(BINHOST_DIR, exist_ok=True)
     os.makedirs(PROFILES_DIR, exist_ok=True)
     os.makedirs(METADATA_DIR, exist_ok=True)
@@ -31,29 +33,37 @@ def setup_directories():
         with open(os.path.join(METADATA_DIR, "layout.conf"), "w") as f:
             f.write("masters = gentoo\nauto-sync = false\n")
 
+    # Write a .gitignore to make sure no binary packages are ever tracked in git
+    with open(".gitignore", "w") as f:
+        f.write("*.gpkg.tar\n*.tbz2\n*.xpak\ntemp_*\n")
+
+    # Clean up any raw packages left over in binhost from previous runs
+    for root, dirs, files in os.walk(BINHOST_DIR):
+        for f in files:
+            if f.endswith(('.gpkg.tar', '.tbz2', '.xpak')):
+                try:
+                    os.remove(os.path.join(root, f))
+                except Exception:
+                    pass
+
 def get_pkg_metadata(filepath):
-    """Extract CATEGORY and PN from modern Gentoo GPKG or legacy TBZ2 packages."""
+    """Extract CATEGORY and PN from a modern Gentoo GPKG or legacy TBZ2 package."""
     category, pn = None, None
-    filename = os.path.basename(filepath)
 
     if filepath.endswith('.gpkg.tar'):
-        # 1. Try Portage's native gpkg parser (available in gentoo/stage3)
+        # 1. Inspect outer tar headers (category is in the internal path: category/PF/metadata.tar.zst)
         try:
-            import portage
-            from portage.gpkg import gpkg
-            pkg = gpkg(portage.settings, filename, filepath)
-            cat_data = pkg.get_metadata("CATEGORY")
-            pn_data = pkg.get_metadata("PN")
-            if cat_data:
-                category = cat_data.decode('utf-8', errors='ignore').strip() if isinstance(cat_data, bytes) else str(cat_data).strip()
-            if pn_data:
-                pn = pn_data.decode('utf-8', errors='ignore').strip() if isinstance(pn_data, bytes) else str(pn_data).strip()
-            if category and pn:
-                return category, pn
+            with tarfile.open(filepath, "r") as tar:
+                for name in tar.getnames():
+                    if "metadata.tar" in name:
+                        parts = name.strip("./").split("/")
+                        if len(parts) >= 3:
+                            category = parts[0]
+                        break
         except Exception:
             pass
 
-        # 2. Fallback: Decompress the nested metadata.tar.zst directly
+        # 2. Decompress nested metadata.tar.zst directly using zstd -dc
         try:
             with tarfile.open(filepath, "r") as outer_tar:
                 for member in outer_tar.getmembers():
@@ -62,14 +72,15 @@ def get_pkg_metadata(filepath):
                         if f:
                             meta_bytes = f.read()
                             if member.name.endswith(".zst"):
-                                proc = subprocess.Popen(["zstd", "-d"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                                proc = subprocess.Popen(["zstd", "-dc"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                                 meta_bytes, _ = proc.communicate(input=meta_bytes)
                             
                             with tarfile.open(fileobj=io.BytesIO(meta_bytes), mode="r:*") as inner_tar:
                                 for inner_member in inner_tar.getmembers():
-                                    if inner_member.name.endswith("CATEGORY"):
+                                    base_name = os.path.basename(inner_member.name)
+                                    if base_name == "CATEGORY":
                                         category = inner_tar.extractfile(inner_member).read().decode('utf-8', errors='ignore').strip()
-                                    elif inner_member.name.endswith("PN"):
+                                    elif base_name == "PN":
                                         pn = inner_tar.extractfile(inner_member).read().decode('utf-8', errors='ignore').strip()
                                 if category and pn:
                                     return category, pn
@@ -93,32 +104,6 @@ def get_pkg_metadata(filepath):
 
     return category, pn
 
-def reorganize_loose_files():
-    """Fix any packages that were dumped in the binhost root by previous runs."""
-    if not os.path.exists(BINHOST_DIR):
-        return
-    for item in os.listdir(BINHOST_DIR):
-        item_path = os.path.join(BINHOST_DIR, item)
-        if os.path.isfile(item_path) and item.endswith(('.gpkg.tar', '.tbz2', '.xpak')):
-            cat, pn = get_pkg_metadata(item_path)
-            if cat and pn:
-                target_dir = os.path.join(BINHOST_DIR, cat, pn)
-                os.makedirs(target_dir, exist_ok=True)
-                shutil.move(item_path, os.path.join(target_dir, item))
-                print(f"Re-organized existing loose package: {cat}/{pn}/{item}")
-
-def get_existing_packages():
-    """Index all properly organized packages."""
-    existing = {}
-    for root, dirs, files in os.walk(BINHOST_DIR):
-        for f in files:
-            if f.endswith(('.gpkg.tar', '.tbz2', '.xpak')):
-                parts = root.split(os.sep)
-                if len(parts) >= 3:
-                    cat, pn = parts[-2], parts[-1]
-                    existing[f] = (cat, pn, f)
-    return existing
-
 def download_asset(asset_info):
     name, url = asset_info
     temp_path = os.path.join(TEMP_DIR, name)
@@ -130,10 +115,6 @@ def download_asset(asset_info):
         return name, None
 
 def fetch_and_organize_binpkgs():
-    reorganize_loose_files()
-    existing_pkgs = get_existing_packages()
-    all_pkgs = list(existing_pkgs.values())
-
     print(f"Fetching releases from {API_URL} ...")
     req = urllib.request.Request(API_URL, headers={'User-Agent': 'Mozilla/5.0'})
     try:
@@ -141,58 +122,95 @@ def fetch_and_organize_binpkgs():
             releases = json.loads(response.read().decode())
     except Exception as e:
         print(f"Error fetching API releases: {e}")
-        return all_pkgs
+        return [], {}
 
+    asset_url_map = {}
     to_download = []
+    
     for release in releases:
         for asset in release.get('assets', []):
             name = asset['name']
             url = asset['browser_download_url']
             
             if name.endswith(('.gpkg.tar', '.tbz2', '.xpak')):
-                if name in existing_pkgs:
-                    continue
+                asset_url_map[name] = url
                 to_download.append((name, url))
 
-    if to_download:
-        print(f"Found {len(to_download)} new package(s). Downloading in parallel (8 threads)...")
-        os.makedirs(TEMP_DIR, exist_ok=True)
-        
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            downloaded = list(executor.map(download_asset, to_download))
+    os.makedirs(TEMP_DIR, exist_ok=True)
+    os.makedirs(TEMP_BINHOST, exist_ok=True)
 
-        for name, temp_path in downloaded:
-            if not temp_path or not os.path.exists(temp_path):
-                continue
-                
-            cat, pn = get_pkg_metadata(temp_path)
+    print(f"Processing {len(to_download)} packages in parallel...")
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        downloaded = list(executor.map(download_asset, to_download))
+
+    all_pkgs = []
+    for name, temp_path in downloaded:
+        if not temp_path or not os.path.exists(temp_path):
+            continue
             
-            if cat and pn:
-                target_dir = os.path.join(BINHOST_DIR, cat, pn)
-                os.makedirs(target_dir, exist_ok=True)
-                target_path = os.path.join(target_dir, name)
-                shutil.move(temp_path, target_path)
-                all_pkgs.append((cat, pn, name))
-                print(f"Organized: {cat}/{pn}/{name}")
-            else:
-                print(f"Warn: Still unable to determine metadata for {name}")
-                shutil.move(temp_path, os.path.join(BINHOST_DIR, name))
+        cat, pn = get_pkg_metadata(temp_path)
+        download_url = asset_url_map.get(name, "")
 
-        shutil.rmtree(TEMP_DIR, ignore_errors=True)
-    else:
-        print("All packages are already up-to-date!")
+        if cat and pn:
+            target_dir = os.path.join(TEMP_BINHOST, cat, pn)
+            os.makedirs(target_dir, exist_ok=True)
+            target_path = os.path.join(target_dir, name)
+            shutil.move(temp_path, target_path)
+            all_pkgs.append((cat, pn, name, download_url))
+        else:
+            # Fallback if category extraction failed
+            target_dir = os.path.join(TEMP_BINHOST, "unknown", "unknown")
+            os.makedirs(target_dir, exist_ok=True)
+            shutil.move(temp_path, os.path.join(target_dir, name))
+            all_pkgs.append(("unknown", "unknown", name, download_url))
 
-    return all_pkgs
+    shutil.rmtree(TEMP_DIR, ignore_errors=True)
+    return all_pkgs, asset_url_map
 
-def generate_packages_index():
+def generate_packages_index(asset_url_map):
     print("Generating Portage 'Packages' index using emaint...")
     try:
         env = os.environ.copy()
-        env['PKGDIR'] = os.path.abspath(BINHOST_DIR)
+        env['PKGDIR'] = os.path.abspath(TEMP_BINHOST)
         subprocess.run(["emaint", "binhost", "--fix"], env=env, check=True)
-        print("Packages index generated successfully.")
+
+        # Read generated Packages file
+        packages_src = os.path.join(TEMP_BINHOST, "Packages")
+        if os.path.exists(packages_src):
+            with open(packages_src, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            # Inject the remote URI into each package entry
+            entries = content.split("\n\n")
+            new_entries = []
+            for entry in entries:
+                if not entry.strip():
+                    continue
+                lines = entry.splitlines()
+                pkg_filename = None
+                for line in lines:
+                    if line.startswith("PATH:"):
+                        pkg_filename = os.path.basename(line.split(":", 1)[1].strip())
+                        break
+                if pkg_filename and pkg_filename in asset_url_map:
+                    lines.append(f"URI: {asset_url_map[pkg_filename]}")
+                new_entries.append("\n".join(lines))
+
+            final_packages = "\n\n".join(new_entries) + "\n"
+
+            # Write clean Packages and Packages.gz to binhost/
+            with open(os.path.join(BINHOST_DIR, "Packages"), "w", encoding="utf-8") as f:
+                f.write(final_packages)
+
+            with gzip.open(os.path.join(BINHOST_DIR, "Packages.gz"), "wb") as f:
+                f.write(final_packages.encode('utf-8'))
+
+            print("Packages and Packages.gz index generated with remote URIs successfully.")
     except Exception as e:
         print(f"emaint binhost generation failed: {e}")
+    finally:
+        # Clean up temporary downloaded binpkgs so they are NEVER committed to git
+        shutil.rmtree(TEMP_BINHOST, ignore_errors=True)
 
 def generate_website(pkgs):
     print("Generating HTML website...")
@@ -230,13 +248,12 @@ EMERGE_DEFAULT_OPTS="${{EMERGE_DEFAULT_OPTS}} --getbinpkg"
     <ul>
 '''
     pkgs.sort(key=lambda x: (x[0], x[1], x[2]))
-    for cat, pn, name in pkgs:
-        path = f"binhost/{name}" if cat == "unknown" else f"binhost/{cat}/{pn}/{name}"
+    for cat, pn, name, download_url in pkgs:
         html += f'''
         <li>
             <div class="package">
                 <span class="category">{cat}/{pn}</span>
-                <a href="{path}">{name}</a>
+                <a href="{download_url}">{name}</a>
             </div>
         </li>'''
 
@@ -250,7 +267,7 @@ EMERGE_DEFAULT_OPTS="${{EMERGE_DEFAULT_OPTS}} --getbinpkg"
 
 if __name__ == "__main__":
     setup_directories()
-    pkgs = fetch_and_organize_binpkgs()
-    generate_packages_index()
+    pkgs, asset_url_map = fetch_and_organize_binpkgs()
+    generate_packages_index(asset_url_map)
     generate_website(pkgs)
     print("Build complete!")
