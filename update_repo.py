@@ -220,17 +220,22 @@ def generate_packages_index(asset_url_map):
                     continue
 
                 new_lines = []
+                pkg_filename = None
+                
+                # First pass to safely extract PATH and remove old URIs
                 for line in lines:
                     if line.startswith("PATH:"):
                         pkg_filename = os.path.basename(line.split(":", 1)[1].strip())
-                        if pkg_filename in asset_url_map:
-                            # Point PATH directly to the GitHub Releases URL
-                            new_lines.append(f"PATH: {asset_url_map[pkg_filename]}")
-                            new_lines.append(f"URI: {asset_url_map[pkg_filename]}")
-                        else:
-                            new_lines.append(line)
+                        new_lines.append(line)  # Keep the original relative path
+                    elif line.startswith("URI:"):
+                        pass  # Strip any existing emaint URI so we can append our own
                     else:
                         new_lines.append(line)
+                
+                # Append our custom GitHub Release URI
+                if pkg_filename and pkg_filename in asset_url_map:
+                    new_lines.append(f"URI: {asset_url_map[pkg_filename]}")
+                
                 new_entries.append("\n".join(new_lines))
 
             final_packages = "\n\n".join(new_entries) + "\n"
@@ -255,98 +260,3 @@ def generate_website(pkgs):
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{REPO_OWNER} Gentoo Repository & Binhost</title>
-    <style>
-        body {{ font-family: system-ui, -apple-system, sans-serif; margin: 2rem auto; max-width: 850px; background: #1e1e1e; color: #e0e0e0; padding: 0 1rem; }}
-        a {{ color: #66b3ff; text-decoration: none; }}
-        a:hover {{ text-decoration: underline; }}
-        h1, h2 {{ border-bottom: 1px solid #444; padding-bottom: 0.5rem; }}
-        ul {{ list-style: none; padding: 0; }}
-        li {{ margin: 0.5rem 0; background: #2a2a2a; padding: 0.8rem 1rem; border-radius: 6px; }}
-        .package {{ display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }}
-        .category {{ font-weight: bold; color: #a0c4ff; }}
-        code {{ background: #000; padding: 0.2rem 0.4rem; border-radius: 4px; font-size: 0.9em; }}
-        pre {{ background: #000; padding: 1rem; border-radius: 6px; overflow-x: auto; border: 1px solid #333; }}
-    </style>
-</head>
-<body>
-    <h1>{REPO_OWNER} Gentoo Repository & Binhost</h1>
-    <p>This is an automated Portage repository and binary package host.</p>
-    
-    <h2>How to Use the Binhost</h2>
-    <p>Add the following lines to your <code>/etc/portage/make.conf</code>:</p>
-    <pre>
-PORTAGE_BINHOST="https://{REPO_OWNER}.github.io/binhost"
-EMERGE_DEFAULT_OPTS="${{EMERGE_DEFAULT_OPTS}} --getbinpkg"
-    </pre>
-
-    <h2>Available Packages ({len(pkgs)})</h2>
-    <ul>
-'''
-    pkgs.sort(key=lambda x: (x[0], x[1], x[2]))
-    for cat, pn, name, download_url in pkgs:
-        main_html += f'''
-        <li>
-            <div class="package">
-                <span class="category">{cat}/{pn}</span>
-                <a href="{download_url}">{name}</a>
-            </div>
-        </li>'''
-
-    main_html += '''
-    </ul>
-</body>
-</html>
-'''
-    with open("index.html", "w", encoding="utf-8") as f:
-        f.write(main_html)
-
-    # 2. Dedicated Binhost Directory Page (/binhost/) to prevent 404s
-    binhost_html = f'''<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Gentoo Binhost Index - {REPO_OWNER}</title>
-    <style>
-        body {{ font-family: system-ui, -apple-system, sans-serif; margin: 2rem auto; max-width: 850px; background: #1e1e1e; color: #e0e0e0; padding: 0 1rem; }}
-        a {{ color: #66b3ff; text-decoration: none; }}
-        a:hover {{ text-decoration: underline; }}
-        h1, h2 {{ border-bottom: 1px solid #444; padding-bottom: 0.5rem; }}
-        pre {{ background: #000; padding: 1rem; border-radius: 6px; overflow-x: auto; border: 1px solid #333; }}
-        ul {{ list-style: none; padding: 0; }}
-        li {{ margin: 0.5rem 0; background: #2a2a2a; padding: 0.8rem 1rem; border-radius: 6px; }}
-        code {{ background: #000; padding: 0.2rem 0.4rem; border-radius: 4px; font-size: 0.9em; }}
-    </style>
-</head>
-<body>
-    <h1>Gentoo Binhost Endpoint</h1>
-    <p>This directory serves the Portage binary package index for <code>{REPO_OWNER}</code>.</p>
-    
-    <h2>Configuration</h2>
-    <p>Add the following to your <code>/etc/portage/make.conf</code>:</p>
-    <pre>
-PORTAGE_BINHOST="https://{REPO_OWNER}.github.io/binhost"
-EMERGE_DEFAULT_OPTS="${{EMERGE_DEFAULT_OPTS}} --getbinpkg"
-    </pre>
-
-    <h2>Index Files</h2>
-    <ul>
-        <li>📄 <a href="Packages">Packages (Plain Text Index)</a></li>
-        <li>📦 <a href="Packages.gz">Packages.gz (Compressed Index)</a></li>
-    </ul>
-
-    <p><a href="../">&larr; Return to main package catalog</a></p>
-</body>
-</html>
-'''
-    with open(os.path.join(BINHOST_DIR, "index.html"), "w", encoding="utf-8") as f:
-        f.write(binhost_html)
-
-if __name__ == "__main__":
-    setup_directories()
-    pkgs, asset_url_map = fetch_and_organize_binpkgs()
-    generate_packages_index(asset_url_map)
-    generate_website(pkgs)
-    print("Build complete!")
