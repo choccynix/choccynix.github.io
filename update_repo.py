@@ -1,338 +1,815 @@
-import os
-import json
-import urllib.request
-import subprocess
-import shutil
-import gzip
-import tempfile
-import re
-from concurrent.futures import ThreadPoolExecutor
+#!/usr/bin/env python3
 
-# --- Configuration ---
+import gzip
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
 REPO_OWNER = "choccynix"
 BINPKG_REPO = f"{REPO_OWNER}/athanor-binpkgs"
-API_URL = f"https://api.github.com/repos/{BINPKG_REPO}/releases?per_page=100"
-BASE_DOWNLOAD_URL = f"https://github.com/{BINPKG_REPO}/releases/download/"
 
-BINHOST_DIR = "binhost"
-PROFILES_DIR = "profiles"
-METADATA_DIR = "metadata"
-TEMP_DIR = "temp_downloads"
-TEMP_BINHOST = "temp_binhost"
+API_URL = (
+    f"https://api.github.com/repos/{BINPKG_REPO}"
+    "/releases?per_page=100"
+)
+
+RELEASE_DOWNLOAD_BASE = (
+    f"https://github.com/{BINPKG_REPO}/releases/download/"
+)
+
+BINHOST_DIR = Path("binhost")
+PROFILES_DIR = Path("profiles")
+METADATA_DIR = Path("metadata")
+TEMP_DIR = Path("temp_downloads")
+
+
+PACKAGE_EXTENSIONS = (
+    ".gpkg.tar",
+    ".tbz2",
+    ".xpak",
+)
+
+
+# ---------------------------------------------------------------------------
+# Repository setup
+# ---------------------------------------------------------------------------
 
 def setup_directories():
-    """Create repository structure and clean up previous artifacts."""
-    os.makedirs(BINHOST_DIR, exist_ok=True)
-    os.makedirs(PROFILES_DIR, exist_ok=True)
-    os.makedirs(METADATA_DIR, exist_ok=True)
-    os.makedirs("/var/db/repos/gentoo", exist_ok=True)
+    """Create the static Gentoo repository/binhost structure."""
 
-    with open(os.path.join(PROFILES_DIR, "repo_name"), "w") as f:
-        f.write(f"{REPO_OWNER}\n")
-    
-    with open(os.path.join(METADATA_DIR, "layout.conf"), "w") as f:
-        f.write("masters = gentoo\nauto-sync = false\n")
+    BINHOST_DIR.mkdir(parents=True, exist_ok=True)
+    PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+    METADATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    with open(".nojekyll", "w") as f:
-        f.write("")
+    # This isn't actually needed by the GitHub Pages binhost, but retaining
+    # the directory makes the generated repository structure conventional.
+    Path("/var/db/repos/gentoo").mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-    with open(".gitignore", "w") as f:
-        f.write("*.gpkg.tar\n*.tbz2\n*.xpak\ntemp_*\n")
+    (PROFILES_DIR / "repo_name").write_text(
+        f"{REPO_OWNER}\n",
+        encoding="utf-8",
+    )
 
-    for root, dirs, files in os.walk(BINHOST_DIR):
-        for f in files:
-            if f.endswith(('.gpkg.tar', '.tbz2', '.xpak')):
-                try:
-                    os.remove(os.path.join(root, f))
-                except Exception:
-                    pass
+    (METADATA_DIR / "layout.conf").write_text(
+        "masters = gentoo\n"
+        "auto-sync = false\n",
+        encoding="utf-8",
+    )
 
-def get_pkg_metadata(filepath):
+    Path(".nojekyll").write_text("", encoding="utf-8")
+
+    Path(".gitignore").write_text(
+        "*.gpkg.tar\n"
+        "*.tbz2\n"
+        "*.xpak\n"
+        "temp_*\n",
+        encoding="utf-8",
+    )
+
+    # Remove old generated Packages indexes.
+    for name in (
+        "Packages",
+        "Packages.gz",
+    ):
+        path = BINHOST_DIR / name
+        if path.exists():
+            path.unlink()
+
+
+# ---------------------------------------------------------------------------
+# GitHub API
+# ---------------------------------------------------------------------------
+
+def github_get_json(url):
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "AthanorOS-Binhost/1.0",
+            "Accept": "application/vnd.github+json",
+        },
+    )
+
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def fetch_releases():
+    print(f"Fetching releases from {API_URL} ...")
+
+    try:
+        return github_get_json(API_URL)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not fetch GitHub releases: {exc}"
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Package metadata
+# ---------------------------------------------------------------------------
+
+def read_xpak_metadata(filepath):
     """
-    Extract CATEGORY and PN from modern Gentoo GPKG packages.
+    Read CATEGORY/PN/PF from an old XPAK/TBZ2 package.
     """
-    category, pn, pf = None, None, None
-    filename = os.path.basename(filepath)
 
-    if filepath.endswith('.gpkg.tar'):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            try:
-                res = subprocess.run(["tar", "-xf", filepath, "-C", tmpdir], capture_output=True, text=True)
-                if res.returncode != 0:
-                    return None, None
+    try:
+        import portage.xpak
 
-                meta_archive = None
-                for root, dirs, files in os.walk(tmpdir):
-                    for f in files:
-                        if "metadata.tar" in f:
-                            meta_archive = os.path.join(root, f)
-                            break
-                    if meta_archive: break
+        xpak = portage.xpak.tbz2(str(filepath))
 
-                if meta_archive:
-                    meta_dir = os.path.join(tmpdir, "meta_extracted")
-                    os.makedirs(meta_dir, exist_ok=True)
+        category = xpak.get_data(b"CATEGORY")
+        pn = xpak.get_data(b"PN")
+        pf = xpak.get_data(b"PF")
 
-                    res2 = subprocess.run(["tar", "-xf", meta_archive, "-C", meta_dir], capture_output=True, text=True)
-                    if res2.returncode != 0:
-                        return None, None
+        category = (
+            category.decode("utf-8", errors="replace").strip()
+            if category else None
+        )
 
-                    for root, dirs, files in os.walk(meta_dir):
-                        if "CATEGORY" in files and not category:
-                            with open(os.path.join(root, "CATEGORY"), "r", encoding="utf-8", errors="ignore") as f:
-                                category = f.read().strip()
-                        if "PN" in files and not pn:
-                            with open(os.path.join(root, "PN"), "r", encoding="utf-8", errors="ignore") as f:
-                                pn = f.read().strip()
-                        if "PF" in files and not pf:
-                            with open(os.path.join(root, "PF"), "r", encoding="utf-8", errors="ignore") as f:
-                                pf = f.read().strip()
-            except Exception:
-                pass
+        pn = (
+            pn.decode("utf-8", errors="replace").strip()
+            if pn else None
+        )
 
-    elif filepath.endswith(('.tbz2', '.xpak')):
+        pf = (
+            pf.decode("utf-8", errors="replace").strip()
+            if pf else None
+        )
+
+        return category, pn, pf
+
+    except Exception:
+        return None, None, None
+
+
+def read_gpkg_metadata(filepath):
+    """
+    Read CATEGORY/PN/PF from a modern GPKG archive.
+
+    GPKG is itself a tar archive containing metadata.
+    """
+
+    category = None
+    pn = None
+    pf = None
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+
         try:
-            import portage.xpak
-            xpak = portage.xpak.tbz2(filepath)
-            cat_data = xpak.get_data(b"CATEGORY")
-            pn_data = xpak.get_data(b"PN")
-            pf_data = xpak.get_data(b"PF")
-            if cat_data: category = cat_data.decode('utf-8', errors='ignore').strip()
-            if pn_data: pn = pn_data.decode('utf-8', errors='ignore').strip()
-            if pf_data: pf = pf_data.decode('utf-8', errors='ignore').strip()
-        except Exception:
-            pass
+            result = subprocess.run(
+                [
+                    "tar",
+                    "-xf",
+                    str(filepath),
+                    "-C",
+                    str(tmp),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
 
-    if category and not pn and pf:
+            if result.returncode != 0:
+                return None, None, None
+
+            metadata_archives = list(
+                tmp.rglob("*metadata*.tar*")
+            )
+
+            for archive in metadata_archives:
+                metadata_dir = tmp / "metadata"
+                metadata_dir.mkdir(exist_ok=True)
+
+                result = subprocess.run(
+                    [
+                        "tar",
+                        "-xf",
+                        str(archive),
+                        "-C",
+                        str(metadata_dir),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+
+                if result.returncode != 0:
+                    continue
+
+                for path in metadata_dir.rglob("*"):
+                    if not path.is_file():
+                        continue
+
+                    if path.name == "CATEGORY" and category is None:
+                        category = path.read_text(
+                            encoding="utf-8",
+                            errors="replace",
+                        ).strip()
+
+                    elif path.name == "PN" and pn is None:
+                        pn = path.read_text(
+                            encoding="utf-8",
+                            errors="replace",
+                        ).strip()
+
+                    elif path.name == "PF" and pf is None:
+                        pf = path.read_text(
+                            encoding="utf-8",
+                            errors="replace",
+                        ).strip()
+
+                if category and pn:
+                    break
+
+        except Exception:
+            return None, None, None
+
+    return category, pn, pf
+
+
+def get_package_metadata(filepath):
+    """
+    Return CATEGORY, PN and PF.
+    """
+
+    name = filepath.name
+
+    if name.endswith(".gpkg.tar"):
+        category, pn, pf = read_gpkg_metadata(filepath)
+
+    elif name.endswith((".tbz2", ".xpak")):
+        category, pn, pf = read_xpak_metadata(filepath)
+
+    else:
+        return None, None, None
+
+    # Some package formats don't expose PN cleanly.
+    if not pn and pf:
         try:
             import portage.versions
-            splitted = portage.versions.pkgsplit(pf)
-            if splitted: pn = splitted[0]
+
+            split = portage.versions.pkgsplit(pf)
+
+            if split:
+                pn = split[0]
+
         except Exception:
             pass
-        if not pn:
-            match = re.match(r'^(.+?)-(\d+.*)$', pf)
-            if match: pn = match.group(1)
 
-    return category, pn
+    if not pn and pf:
+        match = re.match(
+            r"^(.+?)-(\d+(?:\.\d+)*.*)$",
+            pf,
+        )
 
-def download_asset(asset_info):
-    name, url = asset_info
-    temp_path = os.path.join(TEMP_DIR, name)
+        if match:
+            pn = match.group(1)
+
+    return category, pn, pf
+
+
+# ---------------------------------------------------------------------------
+# Asset downloading
+# ---------------------------------------------------------------------------
+
+def download_asset(asset):
+    """
+    Download one package temporarily so its metadata can be inspected.
+    """
+
+    name = asset["name"]
+    url = asset["browser_download_url"]
+
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+    path = TEMP_DIR / name
+
     try:
-        urllib.request.urlretrieve(url, temp_path)
-        return name, temp_path
-    except Exception:
-        return name, None
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "AthanorOS-Binhost/1.0",
+            },
+        )
 
-def fetch_and_organize_binpkgs():
-    print(f"Fetching releases from {API_URL} ...")
-    req = urllib.request.Request(API_URL, headers={'User-Agent': 'Mozilla/5.0'})
-    try:
-        with urllib.request.urlopen(req) as response:
-            releases = json.loads(response.read().decode())
-    except Exception as e:
-        print(f"Error fetching API releases: {e}")
-        return [], {}
+        with urllib.request.urlopen(
+            request,
+            timeout=300,
+        ) as response, open(path, "wb") as output:
 
-    asset_url_map = {}
-    to_download = []
-    
+            shutil.copyfileobj(response, output)
+
+        return asset, path
+
+    except Exception as exc:
+        print(
+            f"[warn] failed downloading {name}: {exc}"
+        )
+        return asset, None
+
+
+# ---------------------------------------------------------------------------
+# Release processing
+# ---------------------------------------------------------------------------
+
+def collect_packages(releases):
+    """
+    Collect package assets from GitHub releases.
+
+    Newest release wins if the same filename exists in multiple releases.
+    """
+
+    packages = {}
+
+    # GitHub normally returns newest releases first, but sort explicitly
+    # so this doesn't depend on API ordering.
+    releases = sorted(
+        releases,
+        key=lambda release: release.get(
+            "published_at",
+            release.get("created_at", ""),
+        ),
+        reverse=True,
+    )
+
     for release in releases:
-        for asset in release.get('assets', []):
-            name = asset['name']
-            url = asset['browser_download_url']
-            
-            if name.endswith(('.gpkg.tar', '.tbz2', '.xpak')) and ".-" not in name:
-                asset_url_map[name] = url
-                to_download.append((name, url))
+        tag = release.get("tag_name")
 
-    os.makedirs(TEMP_DIR, exist_ok=True)
-    os.makedirs(TEMP_BINHOST, exist_ok=True)
-
-    print(f"Downloading and extracting metadata for {len(to_download)} packages (8 threads)...")
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        downloaded = list(executor.map(download_asset, to_download))
-
-    all_pkgs = []
-    for name, temp_path in downloaded:
-        if not temp_path or not os.path.exists(temp_path):
+        if not tag:
             continue
-            
-        cat, pn = get_pkg_metadata(temp_path)
-        download_url = asset_url_map.get(name, "")
 
-        if cat and pn:
-            target_dir = os.path.join(TEMP_BINHOST, cat, pn)
-            os.makedirs(target_dir, exist_ok=True)
-            target_path = os.path.join(target_dir, name)
-            shutil.move(temp_path, target_path)
-            all_pkgs.append((cat, pn, name, download_url))
-        else:
-            print(f"Could not identify metadata for {name}, skipping.")
+        for asset in release.get("assets", []):
+            name = asset.get("name", "")
 
-    shutil.rmtree(TEMP_DIR, ignore_errors=True)
-    return all_pkgs, asset_url_map
+            if not name.endswith(PACKAGE_EXTENSIONS):
+                continue
 
-def generate_packages_index(asset_url_map):
-    print("Generating Portage 'Packages' index via emaint...")
-    try:
-        env = os.environ.copy()
-        env['PKGDIR'] = os.path.abspath(TEMP_BINHOST)
-        subprocess.run(["emaint", "binhost", "--fix"], env=env, check=True)
+            # Ignore signatures and weird generated artifacts.
+            if name.endswith(".sig"):
+                continue
 
-        packages_src = os.path.join(TEMP_BINHOST, "Packages")
-        if os.path.exists(packages_src):
-            with open(packages_src, "r", encoding="utf-8") as f:
-                content = f.read()
+            if name not in packages:
+                packages[name] = {
+                    "release": tag,
+                    "asset": asset,
+                }
 
-            entries = content.split("\n\n")
-            new_entries = []
-            
-            for entry in entries:
-                if not entry.strip():
-                    continue
-                
-                lines = entry.splitlines()
+    print(
+        f"Found {len(packages)} unique binary package assets."
+    )
 
-                # Is this the top-level PACKAGES header?
-                if lines[0].strip() == "PACKAGES":
-                    # Add base URI redirect so Portage knows to hit GitHub
-                    if not any(line.startswith("URI:") for line in lines):
-                        lines.append(f"URI: {BASE_DOWNLOAD_URL}")
-                    new_entries.append("\n".join(lines))
-                    continue
+    return list(packages.values())
 
-                # It's a normal package block
-                new_lines = []
-                for line in lines:
-                    if line.startswith("PATH:"):
-                        pkg_filename = os.path.basename(line.split(":", 1)[1].strip())
-                        if pkg_filename in asset_url_map:
-                            # Rewrite PATH to `<tag>/<filename>` relative path for the GitHub endpoint
-                            full_url = asset_url_map[pkg_filename]
-                            if full_url.startswith(BASE_DOWNLOAD_URL):
-                                relative_path = full_url[len(BASE_DOWNLOAD_URL):]
-                                new_lines.append(f"PATH: {relative_path}")
-                            else:
-                                new_lines.append(line)
-                        else:
-                            new_lines.append(line)
-                    elif line.startswith("URI:"):
-                        pass # Erase any per-package override
-                    else:
-                        new_lines.append(line)
-                new_entries.append("\n".join(new_lines))
 
-            final_packages = "\n\n".join(new_entries) + "\n"
+# ---------------------------------------------------------------------------
+# Packages index
+# ---------------------------------------------------------------------------
 
-            with open(os.path.join(BINHOST_DIR, "Packages"), "w", encoding="utf-8") as f:
-                f.write(final_packages)
+def sha256_file(path):
+    digest = hashlib.sha256()
 
-            with gzip.open(os.path.join(BINHOST_DIR, "Packages.gz"), "wb") as f:
-                f.write(final_packages.encode('utf-8'))
+    with open(path, "rb") as f:
+        for chunk in iter(
+            lambda: f.read(1024 * 1024),
+            b"",
+        ):
+            digest.update(chunk)
 
-            print("Packages index generated successfully with remote GitHub URLs.")
-    except Exception as e:
-        print(f"emaint binhost generation error: {e}")
-    finally:
-        shutil.rmtree(TEMP_BINHOST, ignore_errors=True)
+    return digest.hexdigest()
 
-def generate_website(pkgs):
-    print("Generating HTML websites...")
-    
-    main_html_template = '''<!DOCTYPE html>
+
+def generate_packages_index(package_entries):
+    """
+    Generate a Portage Packages index.
+
+    The important bit is that PATH contains:
+
+        <release-tag>/<filename>
+
+    while URI contains:
+
+        https://github.com/.../releases/download/
+
+    Therefore Portage constructs the real GitHub release URL directly.
+    """
+
+    print("Generating Portage Packages index...")
+
+    entries = []
+
+    for entry in package_entries:
+        category = entry["category"]
+        pn = entry["pn"]
+        pf = entry["pf"]
+        filename = entry["filename"]
+        release = entry["release"]
+        local_path = entry["local_path"]
+
+        # Relative path from the GitHub release download endpoint.
+        path = f"{release}/{filename}"
+
+        stat = local_path.stat()
+
+        # Portage Packages format.
+        block = [
+            f"CPV: {category}/{pf}",
+            f"BUILD_TIME: {int(stat.st_mtime)}",
+            f"SIZE: {stat.st_size}",
+            f"MD5: {hashlib.md5(local_path.read_bytes()).hexdigest()}",
+            f"SHA256: {sha256_file(local_path)}",
+            f"CATEGORY: {category}",
+            f"PN: {pn}",
+            f"PF: {pf}",
+            f"PATH: {path}",
+        ]
+
+        entries.append("\n".join(block))
+
+    header = "\n".join(
+        [
+            "PACKAGES: 1",
+            "TIMESTAMP: 0",
+            f"URI: {RELEASE_DOWNLOAD_BASE}",
+        ]
+    )
+
+    final = (
+        header
+        + "\n\n"
+        + "\n\n".join(entries)
+        + "\n"
+    )
+
+    packages_path = BINHOST_DIR / "Packages"
+    packages_gz_path = BINHOST_DIR / "Packages.gz"
+
+    packages_path.write_text(
+        final,
+        encoding="utf-8",
+    )
+
+    with gzip.open(
+        packages_gz_path,
+        "wb",
+    ) as f:
+        f.write(final.encode("utf-8"))
+
+    print(
+        f"Wrote {len(entries)} package entries."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Main metadata processing
+# ---------------------------------------------------------------------------
+
+def process_packages(package_assets):
+    """
+    Download packages concurrently, extract metadata, then remove them.
+
+    Only metadata is retained in the final GitHub Pages tree.
+    """
+
+    if not package_assets:
+        print("No packages found.")
+        return []
+
+    print(
+        f"Inspecting metadata for "
+        f"{len(package_assets)} packages..."
+    )
+
+    results = []
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [
+            executor.submit(
+                download_asset,
+                entry["asset"],
+            )
+            for entry in package_assets
+        ]
+
+        for future in futures:
+            asset, path = future.result()
+
+            if path is None:
+                continue
+
+            category, pn, pf = get_package_metadata(path)
+
+            if not category or not pn:
+                print(
+                    f"[warn] could not determine metadata "
+                    f"for {asset['name']}"
+                )
+                path.unlink(missing_ok=True)
+                continue
+
+            if not pf:
+                # PF should normally be available, but derive it from
+                # the filename as a fallback.
+                filename = asset["name"]
+
+                pf = filename
+
+                for suffix in (
+                    ".gpkg.tar",
+                    ".tbz2",
+                    ".xpak",
+                ):
+                    if pf.endswith(suffix):
+                        pf = pf[:-len(suffix)]
+                        break
+
+            results.append(
+                {
+                    "category": category,
+                    "pn": pn,
+                    "pf": pf,
+                    "filename": asset["name"],
+                    "release": package_assets[
+                        next(
+                            i
+                            for i, item in enumerate(package_assets)
+                            if item["asset"]["name"]
+                            == asset["name"]
+                        )
+                    ]["release"],
+                    "local_path": path,
+                    "download_url": asset[
+                        "browser_download_url"
+                    ],
+                }
+            )
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Website
+# ---------------------------------------------------------------------------
+
+def generate_website(packages):
+    print("Generating website...")
+
+    packages = sorted(
+        packages,
+        key=lambda p: (
+            p["category"],
+            p["pn"],
+            p["pf"],
+        ),
+    )
+
+    rows = []
+
+    for package in packages:
+        url = (
+            RELEASE_DOWNLOAD_BASE
+            + package["release"]
+            + "/"
+            + package["filename"]
+        )
+
+        rows.append(
+            f"""
+        <li>
+            <div class="package">
+                <span class="category">
+                    {package["category"]}/{package["pn"]}
+                </span>
+                <a href="{url}">
+                    {package["filename"]}
+                </a>
+            </div>
+        </li>
+"""
+        )
+
+    html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>__REPO_OWNER__ Gentoo Repository & Binhost</title>
-    <style>
-        body { font-family: system-ui, -apple-system, sans-serif; margin: 2rem auto; max-width: 850px; background: #1e1e1e; color: #e0e0e0; padding: 0 1rem; }
-        a { color: #66b3ff; text-decoration: none; }
-        a:hover { text-decoration: underline; }
-        h1, h2 { border-bottom: 1px solid #444; padding-bottom: 0.5rem; }
-        ul { list-style: none; padding: 0; }
-        li { margin: 0.5rem 0; background: #2a2a2a; padding: 0.8rem 1rem; border-radius: 6px; }
-        .package { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }
-        .category { font-weight: bold; color: #a0c4ff; }
-        code { background: #000; padding: 0.2rem 0.4rem; border-radius: 4px; font-size: 0.9em; }
-        pre { background: #000; padding: 1rem; border-radius: 6px; overflow-x: auto; border: 1px solid #333; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport"
+      content="width=device-width, initial-scale=1.0">
+<title>{REPO_OWNER} Gentoo Binhost</title>
+
+<style>
+body {{
+    font-family: system-ui, sans-serif;
+    margin: 2rem auto;
+    max-width: 900px;
+    background: #1e1e1e;
+    color: #e0e0e0;
+    padding: 0 1rem;
+}}
+
+a {{
+    color: #66b3ff;
+    text-decoration: none;
+}}
+
+a:hover {{
+    text-decoration: underline;
+}}
+
+h1, h2 {{
+    border-bottom: 1px solid #444;
+    padding-bottom: .5rem;
+}}
+
+ul {{
+    list-style: none;
+    padding: 0;
+}}
+
+li {{
+    margin: .5rem 0;
+    background: #2a2a2a;
+    padding: .8rem 1rem;
+    border-radius: 6px;
+}}
+
+.package {{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1rem;
+    flex-wrap: wrap;
+}}
+
+.category {{
+    font-weight: bold;
+    color: #a0c4ff;
+}}
+
+code, pre {{
+    background: #000;
+    border-radius: 4px;
+}}
+
+code {{
+    padding: .2rem .4rem;
+}}
+
+pre {{
+    padding: 1rem;
+    overflow-x: auto;
+}}
+</style>
 </head>
+
 <body>
-    <h1>__REPO_OWNER__ Gentoo Repository & Binhost</h1>
-    <p>This is an automated Portage repository and binary package host.</p>
-    
-    <h2>How to Use the Binhost</h2>
-    <p>Add the following lines to your <code>/etc/portage/make.conf</code>:</p>
-    <pre>
-PORTAGE_BINHOST="https://__REPO_OWNER__.github.io/binhost"
-EMERGE_DEFAULT_OPTS="${EMERGE_DEFAULT_OPTS} --getbinpkg"
-    </pre>
 
-    <h2>Available Packages (__PKG_COUNT__)</h2>
-    <ul>
-'''
-    main_html = main_html_template.replace("__REPO_OWNER__", REPO_OWNER).replace("__PKG_COUNT__", str(len(pkgs)))
+<h1>{REPO_OWNER} Gentoo Binhost</h1>
 
-    pkgs.sort(key=lambda x: (x[0], x[1], x[2]))
-    for cat, pn, name, download_url in pkgs:
-        main_html += f'        <li><div class="package"><span class="category">{cat}/{pn}</span><a href="{download_url}">{name}</a></div></li>\n'
+<p>
+Automated Gentoo binary package host for AthanorOS.
+</p>
 
-    main_html += '''
-    </ul>
+<h2>Configuration</h2>
+
+<p>
+Add this to
+<code>/etc/portage/binrepos.conf/athanor.conf</code>:
+</p>
+
+<pre>[athanor]
+priority = 9999
+sync-uri = https://{REPO_OWNER}.github.io/binhost
+</pre>
+
+<p>
+Or, for older Portage installations:
+</p>
+
+<pre>PORTAGE_BINHOST="https://{REPO_OWNER}.github.io/binhost"</pre>
+
+<h2>Available Packages ({len(packages)})</h2>
+
+<ul>
+{"".join(rows)}
+</ul>
+
 </body>
 </html>
-'''
-    with open("index.html", "w", encoding="utf-8") as f:
-        f.write(main_html)
+"""
 
-    binhost_html_template = '''<!DOCTYPE html>
+    Path("index.html").write_text(
+        html,
+        encoding="utf-8",
+    )
+
+
+def generate_binhost_page():
+    html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Gentoo Binhost Index - __REPO_OWNER__</title>
-    <style>
-        body { font-family: system-ui, -apple-system, sans-serif; margin: 2rem auto; max-width: 850px; background: #1e1e1e; color: #e0e0e0; padding: 0 1rem; }
-        a { color: #66b3ff; text-decoration: none; }
-        a:hover { text-decoration: underline; }
-        h1, h2 { border-bottom: 1px solid #444; padding-bottom: 0.5rem; }
-        pre { background: #000; padding: 1rem; border-radius: 6px; overflow-x: auto; border: 1px solid #333; }
-        ul { list-style: none; padding: 0; }
-        li { margin: 0.5rem 0; background: #2a2a2a; padding: 0.8rem 1rem; border-radius: 6px; }
-        code { background: #000; padding: 0.2rem 0.4rem; border-radius: 4px; font-size: 0.9em; }
-    </style>
+<meta charset="UTF-8">
+<title>{REPO_OWNER} Binhost</title>
 </head>
+
 <body>
-    <h1>Gentoo Binhost Endpoint</h1>
-    <p>This directory serves the Portage binary package index for <code>__REPO_OWNER__</code>.</p>
-    
-    <h2>Configuration</h2>
-    <p>Add the following to your <code>/etc/portage/make.conf</code>:</p>
-    <pre>
-PORTAGE_BINHOST="https://__REPO_OWNER__.github.io/binhost"
-EMERGE_DEFAULT_OPTS="${EMERGE_DEFAULT_OPTS} --getbinpkg"
-    </pre>
 
-    <h2>Index Files</h2>
-    <ul>
-        <li>📄 <a href="Packages">Packages (Plain Text Index)</a></li>
-        <li>📦 <a href="Packages.gz">Packages.gz (Compressed Index)</a></li>
-    </ul>
+<h1>{REPO_OWNER} Gentoo Binary Package Host</h1>
 
-    <p><a href="../">&larr; Return to main package catalog</a></p>
+<p>
+Portage binary package index.
+</p>
+
+<ul>
+<li>
+<a href="Packages">Packages</a>
+</li>
+
+<li>
+<a href="Packages.gz">Packages.gz</a>
+</li>
+</ul>
+
 </body>
 </html>
-'''
-    binhost_html = binhost_html_template.replace("__REPO_OWNER__", REPO_OWNER)
-    with open(os.path.join(BINHOST_DIR, "index.html"), "w", encoding="utf-8") as f:
-        f.write(binhost_html)
+"""
+
+    (BINHOST_DIR / "index.html").write_text(
+        html,
+        encoding="utf-8",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    setup_directories()
+
+    releases = fetch_releases()
+
+    package_assets = collect_packages(
+        releases
+    )
+
+    packages = process_packages(
+        package_assets
+    )
+
+    if not packages:
+        raise RuntimeError(
+            "No packages with readable metadata were found."
+        )
+
+    # The release URL is deterministic, so don't rely on browser_download_url
+    # for the Packages index.
+    generate_packages_index(
+        packages
+    )
+
+    generate_website(
+        packages
+    )
+
+    generate_binhost_page()
+
+    # We don't need the downloaded packages anymore.
+    shutil.rmtree(
+        TEMP_DIR,
+        ignore_errors=True,
+    )
+
+    print()
+    print("========================================")
+    print("AthanorOS binhost generation complete")
+    print("========================================")
+    print(
+        f"Packages: {len(packages)}"
+    )
+    print(
+        f"Binhost: https://{REPO_OWNER}.github.io/binhost"
+    )
+    print(
+        f"Release base: {RELEASE_DOWNLOAD_BASE}"
+    )
+
 
 if __name__ == "__main__":
-    setup_directories()
-    pkgs, asset_url_map = fetch_and_organize_binpkgs()
-    generate_packages_index(asset_url_map)
-    generate_website(pkgs)
-    print("Build complete!")
+    main()
