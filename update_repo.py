@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -25,14 +26,12 @@ API_URL = (
     "/releases?per_page=100"
 )
 
-# IMPORTANT:
-# This is only the base of GitHub's release-download endpoint.
+# GitHub Releases download endpoint.
 #
-# A package URI will become:
+# Final package URL:
 #
 # https://github.com/choccynix/athanor-binpkgs/releases/download/
-#     binpkgs-rolling-20260822/
-#     package-name-version.gpkg.tar
+#     <release-tag>/<filename>
 #
 RELEASE_DOWNLOAD_BASE = (
     f"https://github.com/{BINPKG_REPO}/releases/download/"
@@ -63,7 +62,7 @@ def setup_directories():
     PROFILES_DIR.mkdir(parents=True, exist_ok=True)
     METADATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Kept for compatibility with the existing build environment.
+    # Compatibility with the existing build environment.
     Path("/var/db/repos/gentoo").mkdir(
         parents=True,
         exist_ok=True,
@@ -93,7 +92,7 @@ def setup_directories():
         encoding="utf-8",
     )
 
-    # Remove old indexes so a failed generation cannot leave stale data.
+    # Remove stale generated indexes.
     for filename in (
         "Packages",
         "Packages.gz",
@@ -213,8 +212,6 @@ def read_xpak_metadata(filepath):
 def read_gpkg_metadata(filepath):
     """
     Extract CATEGORY/PN/PF from a modern GPKG package.
-
-    GPKG is a tar archive containing a metadata archive.
     """
 
     category = None
@@ -329,8 +326,6 @@ def derive_pn_from_pf(pf):
     except Exception:
         pass
 
-    # Gentoo version strings are complicated, so this is only
-    # a fallback if Portage itself is unavailable.
     match = re.match(
         r"^(.+?)-"
         r"(\d+(?:\.\d+)*"
@@ -377,12 +372,11 @@ def get_package_metadata(filepath):
 
 def download_asset(job):
     """
-    Download a package temporarily so we can inspect its metadata.
-
-    The package itself is NEVER copied into the GitHub Pages repository.
+    Download a package temporarily so its metadata can be inspected.
     """
 
     asset = job["asset"]
+
     name = asset["name"]
     url = asset["browser_download_url"]
 
@@ -436,8 +430,8 @@ def collect_packages(releases):
     """
     Find all binary package assets.
 
-    Newest release wins when the exact same filename appears
-    in multiple releases.
+    Releases are processed newest first. If the same filename exists
+    in multiple releases, the newest release wins.
     """
 
     releases = sorted(
@@ -478,10 +472,6 @@ def collect_packages(releases):
             ):
                 continue
 
-            # Exact filename deduplication.
-            #
-            # Since releases are processed newest first,
-            # this automatically keeps the newest copy.
             if name in packages:
                 continue
 
@@ -532,9 +522,7 @@ def hash_file(path, algorithm):
 def process_packages(package_jobs):
     """
     Download packages concurrently, inspect metadata,
-    and return the metadata needed for Packages.
-
-    The package files are deleted afterward.
+    and return the metadata needed by Packages.
     """
 
     if not package_jobs:
@@ -586,8 +574,6 @@ def process_packages(package_jobs):
 
                 continue
 
-            # PF is normally present in package metadata.
-            # Derive it from the filename only if necessary.
             if not pf:
                 pf = asset["name"]
 
@@ -620,7 +606,7 @@ def process_packages(package_jobs):
 
 
 # ============================================================================
-# Packages index generation
+# Packages index
 # ============================================================================
 
 def generate_packages_index(packages):
@@ -629,21 +615,19 @@ def generate_packages_index(packages):
 
     IMPORTANT:
 
-    GitHub Releases requires:
-
-        /releases/download/<TAG>/<ASSET>
-
-    Therefore each package gets:
+    Each package has its own release URI:
 
         URI: https://github.com/.../releases/download/<TAG>/
-        PATH: <ASSET>
 
-    NOT:
+    and its PATH is only the release asset name:
 
-        URI: https://github.com/.../releases/download/
-        PATH: <TAG>/<ASSET>
+        PATH: package-version.gpkg.tar
 
-    This is the critical part that fixes the broken package URLs.
+    This produces:
+
+        https://github.com/.../releases/download/<TAG>/package-version.gpkg.tar
+
+    Do NOT run `emaint binhost --fix` against this afterward.
     """
 
     print(
@@ -681,16 +665,16 @@ def generate_packages_index(packages):
             "sha256",
         )
 
-        # THIS IS THE IMPORTANT FIX.
-        #
-        # URI ends with the release tag.
+        # ================================================================
+        # THE IMPORTANT URL FIX
+        # ================================================================
+
         package_uri = (
             RELEASE_DOWNLOAD_BASE
             + release
             + "/"
         )
 
-        # PATH is ONLY the release asset name.
         package_path = filename
 
         block = [
@@ -710,14 +694,25 @@ def generate_packages_index(packages):
             "\n".join(block)
         )
 
-    # Do NOT put a global GitHub URI here.
+    # ========================================================================
+    # IMPORTANT PACKAGE INDEX HEADER
     #
-    # Each package has its own URI because packages can live
-    # in different releases.
+    # VERSION is required by Portage.
+    # TIMESTAMP must be a real timestamp.
+    #
+    # There is intentionally NO global URI here because packages may
+    # reside in different GitHub releases.
+    # ========================================================================
+
+    timestamp = int(
+        time.time()
+    )
+
     header = "\n".join(
         [
             "PACKAGES: 1",
-            "TIMESTAMP: 0",
+            "VERSION: 1",
+            f"TIMESTAMP: {timestamp}",
         ]
     )
 
@@ -753,13 +748,28 @@ def generate_packages_index(packages):
         f"Wrote {len(blocks)} package entries."
     )
 
+    # Print one URL so the Actions log makes debugging easy.
+    if packages:
+        first = packages[0]
+
+        test_url = (
+            RELEASE_DOWNLOAD_BASE
+            + first["release"]
+            + "/"
+            + first["filename"]
+        )
+
+        print(
+            f"Example package URL: {test_url}"
+        )
+
 
 # ============================================================================
 # Website
 # ============================================================================
 
 def generate_website(packages):
-    """Generate the package catalog."""
+    """Generate the main package catalog."""
 
     packages = sorted(
         packages,
@@ -782,29 +792,32 @@ def generate_website(packages):
 
         rows.append(
             f"""
-<li>
-    <div class="package">
-        <span class="category">
-            {package["category"]}/{package["pn"]}
-        </span>
-        <a href="{url}">
-            {package["filename"]}
-        </a>
-    </div>
-</li>
+        <li>
+            <div class="package">
+                <span class="category">
+                    {package["category"]}/{package["pn"]}
+                </span>
+                <a href="{url}">
+                    {package["filename"]}
+                </a>
+            </div>
+        </li>
 """
         )
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
+
 <meta charset="UTF-8">
+
 <meta name="viewport"
       content="width=device-width, initial-scale=1.0">
 
 <title>{REPO_OWNER} Gentoo Binhost</title>
 
 <style>
+
 body {{
     font-family:
         system-ui,
@@ -850,6 +863,7 @@ li {{
     display: flex;
     justify-content: space-between;
     align-items: center;
+
     gap: 1rem;
     flex-wrap: wrap;
 }}
@@ -872,7 +886,9 @@ pre {{
     padding: 1rem;
     overflow-x: auto;
 }}
+
 </style>
+
 </head>
 
 <body>
@@ -927,8 +943,11 @@ def generate_binhost_page():
 <html lang="en">
 
 <head>
+
 <meta charset="UTF-8">
+
 <title>{REPO_OWNER} Binhost</title>
+
 </head>
 
 <body>
@@ -940,6 +959,7 @@ Portage binary package index.
 </p>
 
 <ul>
+
 <li>
 <a href="Packages">
 Packages
@@ -951,9 +971,11 @@ Packages
 Packages.gz
 </a>
 </li>
+
 </ul>
 
 </body>
+
 </html>
 """
 
@@ -998,7 +1020,7 @@ def main():
 
     generate_binhost_page()
 
-    # Temporary package downloads are no longer needed.
+    # Delete downloaded packages.
     shutil.rmtree(
         TEMP_DIR,
         ignore_errors=True,
@@ -1014,13 +1036,16 @@ def main():
     print(
         "========================================"
     )
+
     print(
         f"Packages: {len(packages)}"
     )
+
     print(
         "Binhost:"
         f" https://{REPO_OWNER}.github.io/binhost"
     )
+
     print(
         "Release base:"
         f" {RELEASE_DOWNLOAD_BASE}"
