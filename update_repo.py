@@ -32,6 +32,10 @@ def setup_directories():
     with open(os.path.join(METADATA_DIR, "layout.conf"), "w") as f:
         f.write("masters = gentoo\nauto-sync = false\n")
 
+    # Tell GitHub Pages not to use Jekyll
+    with open(".nojekyll", "w") as f:
+        f.write("")
+
     with open(".gitignore", "w") as f:
         f.write("*.gpkg.tar\n*.tbz2\n*.xpak\ntemp_*\n")
 
@@ -114,7 +118,6 @@ def get_pkg_metadata(filepath):
     # 5. Calculate PN from PF if PN was not saved by Portage
     if category and not pn and pf:
         try:
-            # Use Gentoo's native package splitter to separate name from version
             import portage.versions
             splitted = portage.versions.pkgsplit(pf)
             if splitted:
@@ -122,7 +125,6 @@ def get_pkg_metadata(filepath):
         except Exception:
             pass
             
-        # Fallback regex just in case portage module fails
         if not pn:
             match = re.match(r'^(.+?)-(\d+.*)$', pf)
             if match:
@@ -211,14 +213,25 @@ def generate_packages_index(asset_url_map):
                 if not entry.strip():
                     continue
                 lines = entry.splitlines()
-                pkg_filename = None
+
+                # Preserve the top-level PACKAGES header
+                if lines[0].strip() == "PACKAGES":
+                    new_entries.append("\n".join(lines))
+                    continue
+
+                new_lines = []
                 for line in lines:
                     if line.startswith("PATH:"):
                         pkg_filename = os.path.basename(line.split(":", 1)[1].strip())
-                        break
-                if pkg_filename and pkg_filename in asset_url_map:
-                    lines.append(f"URI: {asset_url_map[pkg_filename]}")
-                new_entries.append("\n".join(lines))
+                        if pkg_filename in asset_url_map:
+                            # Point PATH directly to the GitHub Releases URL
+                            new_lines.append(f"PATH: {asset_url_map[pkg_filename]}")
+                            new_lines.append(f"URI: {asset_url_map[pkg_filename]}")
+                        else:
+                            new_lines.append(line)
+                    else:
+                        new_lines.append(line)
+                new_entries.append("\n".join(new_lines))
 
             final_packages = "\n\n".join(new_entries) + "\n"
 
@@ -228,15 +241,17 @@ def generate_packages_index(asset_url_map):
             with gzip.open(os.path.join(BINHOST_DIR, "Packages.gz"), "wb") as f:
                 f.write(final_packages.encode('utf-8'))
 
-            print("Packages index generated successfully.")
+            print("Packages index generated successfully with remote GitHub URLs.")
     except Exception as e:
         print(f"emaint binhost generation error: {e}")
     finally:
         shutil.rmtree(TEMP_BINHOST, ignore_errors=True)
 
 def generate_website(pkgs):
-    print("Generating HTML website...")
-    html = f'''<!DOCTYPE html>
+    print("Generating HTML websites...")
+    
+    # 1. Main Home Page (/)
+    main_html = f'''<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -271,7 +286,7 @@ EMERGE_DEFAULT_OPTS="${{EMERGE_DEFAULT_OPTS}} --getbinpkg"
 '''
     pkgs.sort(key=lambda x: (x[0], x[1], x[2]))
     for cat, pn, name, download_url in pkgs:
-        html += f'''
+        main_html += f'''
         <li>
             <div class="package">
                 <span class="category">{cat}/{pn}</span>
@@ -279,13 +294,55 @@ EMERGE_DEFAULT_OPTS="${{EMERGE_DEFAULT_OPTS}} --getbinpkg"
             </div>
         </li>'''
 
-    html += '''
+    main_html += '''
     </ul>
 </body>
 </html>
 '''
-    with open("index.html", "w") as f:
-        f.write(html)
+    with open("index.html", "w", encoding="utf-8") as f:
+        f.write(main_html)
+
+    # 2. Dedicated Binhost Directory Page (/binhost/) to prevent 404s
+    binhost_html = f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gentoo Binhost Index - {REPO_OWNER}</title>
+    <style>
+        body {{ font-family: system-ui, -apple-system, sans-serif; margin: 2rem auto; max-width: 850px; background: #1e1e1e; color: #e0e0e0; padding: 0 1rem; }}
+        a {{ color: #66b3ff; text-decoration: none; }}
+        a:hover {{ text-decoration: underline; }}
+        h1, h2 {{ border-bottom: 1px solid #444; padding-bottom: 0.5rem; }}
+        pre {{ background: #000; padding: 1rem; border-radius: 6px; overflow-x: auto; border: 1px solid #333; }}
+        ul {{ list-style: none; padding: 0; }}
+        li {{ margin: 0.5rem 0; background: #2a2a2a; padding: 0.8rem 1rem; border-radius: 6px; }}
+        code {{ background: #000; padding: 0.2rem 0.4rem; border-radius: 4px; font-size: 0.9em; }}
+    </style>
+</head>
+<body>
+    <h1>Gentoo Binhost Endpoint</h1>
+    <p>This directory serves the Portage binary package index for <code>{REPO_OWNER}</code>.</p>
+    
+    <h2>Configuration</h2>
+    <p>Add the following to your <code>/etc/portage/make.conf</code>:</p>
+    <pre>
+PORTAGE_BINHOST="https://{REPO_OWNER}.github.io/binhost"
+EMERGE_DEFAULT_OPTS="${{EMERGE_DEFAULT_OPTS}} --getbinpkg"
+    </pre>
+
+    <h2>Index Files</h2>
+    <ul>
+        <li>📄 <a href="Packages">Packages (Plain Text Index)</a></li>
+        <li>📦 <a href="Packages.gz">Packages.gz (Compressed Index)</a></li>
+    </ul>
+
+    <p><a href="../">&larr; Return to main package catalog</a></p>
+</body>
+</html>
+'''
+    with open(os.path.join(BINHOST_DIR, "index.html"), "w", encoding="utf-8") as f:
+        f.write(binhost_html)
 
 if __name__ == "__main__":
     setup_directories()
@@ -293,4 +350,3 @@ if __name__ == "__main__":
     generate_packages_index(asset_url_map)
     generate_website(pkgs)
     print("Build complete!")
-
