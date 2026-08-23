@@ -3,7 +3,6 @@
 import gzip
 import hashlib
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -62,7 +61,7 @@ def setup_directories():
     PROFILES_DIR.mkdir(parents=True, exist_ok=True)
     METADATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Compatibility with the existing build environment.
+    # Compatibility with existing build environment.
     Path("/var/db/repos/gentoo").mkdir(
         parents=True,
         exist_ok=True,
@@ -92,7 +91,7 @@ def setup_directories():
         encoding="utf-8",
     )
 
-    # Remove stale generated indexes.
+    # Remove stale generated index files.
     for filename in (
         "Packages",
         "Packages.gz",
@@ -430,8 +429,9 @@ def collect_packages(releases):
     """
     Find all binary package assets.
 
-    Releases are processed newest first. If the same filename exists
-    in multiple releases, the newest release wins.
+    Releases are processed newest first.
+    If the same filename exists in multiple releases,
+    the newest release wins.
     """
 
     releases = sorted(
@@ -615,17 +615,20 @@ def generate_packages_index(packages):
 
     IMPORTANT:
 
-    Each package has its own release URI:
+    The package index version supported by current Portage
+    is VERSION: 0.
 
-        URI: https://github.com/.../releases/download/<TAG>/
+    Each package has its own GitHub Release URI:
 
-    and its PATH is only the release asset name:
+        URI: .../releases/download/<TAG>/
+
+    and PATH contains only the release asset filename:
 
         PATH: package-version.gpkg.tar
 
     This produces:
 
-        https://github.com/.../releases/download/<TAG>/package-version.gpkg.tar
+        .../releases/download/<TAG>/package-version.gpkg.tar
 
     Do NOT run `emaint binhost --fix` against this afterward.
     """
@@ -666,7 +669,7 @@ def generate_packages_index(packages):
         )
 
         # ================================================================
-        # THE IMPORTANT URL FIX
+        # GitHub Releases URL
         # ================================================================
 
         package_uri = (
@@ -675,6 +678,7 @@ def generate_packages_index(packages):
             + "/"
         )
 
+        # PATH must contain ONLY the asset name.
         package_path = filename
 
         block = [
@@ -695,13 +699,12 @@ def generate_packages_index(packages):
         )
 
     # ========================================================================
-    # IMPORTANT PACKAGE INDEX HEADER
+    # PORTAGE PACKAGE INDEX HEADER
     #
-    # VERSION is required by Portage.
-    # TIMESTAMP must be a real timestamp.
+    # VERSION MUST BE 0.
     #
-    # There is intentionally NO global URI here because packages may
-    # reside in different GitHub releases.
+    # Portage currently initializes its supported package-index version
+    # as 0 and accepts versions <= that value.
     # ========================================================================
 
     timestamp = int(
@@ -711,7 +714,7 @@ def generate_packages_index(packages):
     header = "\n".join(
         [
             "PACKAGES: 1",
-            "VERSION: 1",
+            "VERSION: 0",
             f"TIMESTAMP: {timestamp}",
         ]
     )
@@ -748,7 +751,7 @@ def generate_packages_index(packages):
         f"Wrote {len(blocks)} package entries."
     )
 
-    # Print one URL so the Actions log makes debugging easy.
+    # Print a real example URL for the Actions log.
     if packages:
         first = packages[0]
 
@@ -1020,7 +1023,7 @@ def main():
 
     generate_binhost_page()
 
-    # Delete downloaded packages.
+    # Delete temporary package downloads.
     shutil.rmtree(
         TEMP_DIR,
         ignore_errors=True,
